@@ -47,7 +47,7 @@ jobs:
         run: |
           git config --global user.email "bot@example.com"
           git config --global user.name "GitHub Bot"
-          git add cookies.json
+          git add -f cookies.json
           git commit -m "Update cookies.json"
           git push
         env:
