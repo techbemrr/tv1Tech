@@ -1,0 +1,53 @@
+name: TradingView Scraper
+
+on:
+  schedule:
+    - cron: "30 13 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create .env file
+        run: |
+          echo "SHEET_ID=${{ secrets.SHEET_ID }}" >> .env
+          echo "SOURCE_SHEET=${{ secrets.SOURCE_SHEET }}" >> .env
+
+          echo "OUTPUT_SHEET_ID=${{ secrets.OUTPUT_SHEET_ID }}" >> .env
+          echo "OUTPUT_SHEET=${{ secrets.OUTPUT_SHEET }}" >> .env
+
+          echo "GOOGLE_SERVICE_ACCOUNT_EMAIL=${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}" >> .env
+          echo "GOOGLE_PRIVATE_KEY=\"${{ secrets.GOOGLE_PRIVATE_KEY }}\"" >> .env
+        shell: bash
+
+      - name: Restore cookies.json from base64
+        run: |
+          echo "${{ secrets.COOKIES_BASE64 }}" | base64 -d > cookies.json
+        shell: bash
+
+      - name: Run scraper
+        run: node index.js
+
+      - name: 📤 Commit updated cookies (optional)
+        if: success()
+        run: |
+          git config --global user.email "bot@example.com"
+          git config --global user.name "GitHub Bot"
+          git add cookies.json
+          git commit -m "Update cookies.json"
+          git push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
