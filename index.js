@@ -57,15 +57,24 @@ async function loadCookies(page) {
 
   const chartLinks = await getChartLinks();
 
-  for (let i = 0; i < chartLinks.length; i++) {
-    const url = chartLinks[i];
+  const batchIndex = parseInt(process.argv[2] || "0", 10);
+  const BATCH_SIZE = 500;
+  const start = batchIndex * BATCH_SIZE;
+  const end = start + BATCH_SIZE;
+  const batchLinks = chartLinks.slice(start, end);
+  console.log(`🔢 Processing batch ${batchIndex}: ${batchLinks.length} charts`);
+
+  for (let i = 0; i < batchLinks.length; i++) {
+    const url = batchLinks[i];
     if (!url) continue;
 
-    console.log(`📈 Scraping Row ${i + 2}: ${url}`);
+    const originalIndex = start + i;
+
+    console.log(`📈 Scraping Row ${originalIndex + 2}: ${url}`);
     try {
       const values = await scrapeChart(page, url);
       const rowData = [url, ...values];
-      await writeValuesToNewSheet(i, rowData);
+      await writeValuesToNewSheet(originalIndex, rowData);
     } catch (err) {
       console.error(`⚠️ Error scraping ${url}:`, err.message);
     }

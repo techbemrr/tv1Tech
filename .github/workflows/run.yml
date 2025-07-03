@@ -7,8 +7,10 @@ on:
 
 jobs:
   scrape:
+    strategy:
+      matrix:
+        batch: [0, 1, 2, 3, 4]
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,14 +36,13 @@ jobs:
         shell: bash
 
       - name: Restore cookies.json from base64
-        run: |
-          echo "${{ secrets.COOKIES_BASE64 }}" | base64 -d > cookies.json
+        run: echo "${{ secrets.COOKIES_BASE64 }}" | base64 -d > cookies.json
         shell: bash
 
-      - name: Run scraper
-        run: node index.js
+      - name: Run scraper for batch ${{ matrix.batch }}
+        run: node index.js ${{ matrix.batch }}
 
-      - name: 📤 Commit updated cookies (optional)
+      - name: Commit updated cookies
         if: success()
         run: |
           git config --global user.email "bot@example.com"
