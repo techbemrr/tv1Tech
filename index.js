@@ -7,8 +7,8 @@ import { getChartLinks, writeValuesToNewSheet } from "./sheets.js";
 
 const COOKIE_PATH = "./cookies.json";
 
-if (process.env.COOKIES_B64 && !fs.existsSync(COOKIE_PATH)) {
-  const decoded = Buffer.from(process.env.COOKIES_B64, "base64").toString(
+if (process.env.COOKIES_BASE64 && !fs.existsSync(COOKIE_PATH)) {
+  const decoded = Buffer.from(process.env.COOKIES_BASE64, "base64").toString(
     "utf-8"
   );
   fs.writeFileSync(COOKIE_PATH, decoded);
