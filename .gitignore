@@ -1,4 +1,4 @@
 node_modules
 .env
-cookies.bs4
+cookies.b64
 cookies.json
