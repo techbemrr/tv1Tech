@@ -35,7 +35,7 @@ async function loadCookies(page) {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
-  const page = await browser.newPage();
+  let page = await browser.newPage();
 
   const hasCookies = await loadCookies(page);
   if (!hasCookies) {
