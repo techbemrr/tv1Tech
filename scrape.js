@@ -11,7 +11,7 @@ async function safeGoto(page, url, retries = 3) {
     } catch (err) {
       console.warn(`🔁 Retry ${i + 1} for ${url} – ${err.message}`);
       if (i === retries - 1) return false;
-      await page.waitForTimeout(3000);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
   }
 }
