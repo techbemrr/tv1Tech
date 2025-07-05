@@ -9,7 +9,7 @@ jobs:
   scrape:
     strategy:
       matrix:
-        batch: [0, 1, 2, 3, 4]
+        batch: [0, 1, 2, 3, 4, 5, 6]
       fail-fast: false
     runs-on: ubuntu-latest
     steps:

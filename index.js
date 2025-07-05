@@ -58,7 +58,7 @@ async function loadCookies(page) {
   const chartLinks = await getChartLinks();
 
   const batchIndex = parseInt(process.argv[2] || "0", 10);
-  const BATCH_SIZE = 500;
+  const BATCH_SIZE = 400;
   const start = batchIndex * BATCH_SIZE;
   const end = start + BATCH_SIZE;
   const batchLinks = chartLinks.slice(start, end);
@@ -84,7 +84,7 @@ async function loadCookies(page) {
       page = await browser.newPage();
       await loadCookies(page);
     }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
 
   await browser.close();
