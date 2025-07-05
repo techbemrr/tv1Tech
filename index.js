@@ -78,6 +78,13 @@ async function loadCookies(page) {
     } catch (err) {
       console.error(`⚠️ Error scraping ${url}:`, err.message);
     }
+    if ((i + 1) % 200 === 0) {
+      console.log(" Restarting page to clear memory...");
+      await page.close();
+      page = await browser.newPage();
+      await loadCookies(page);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   }
 
   await browser.close();

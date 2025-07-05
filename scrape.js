@@ -1,7 +1,28 @@
 // scrape.js
+async function safeGoto(page, url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+      const content = await page.content();
+      if (!content.includes("legend")) {
+        throw new Error("Possibly logged out or blocked.");
+      }
+      return true;
+    } catch (err) {
+      console.warn(`🔁 Retry ${i + 1} for ${url} – ${err.message}`);
+      if (i === retries - 1) return false;
+      await page.waitForTimeout(3000);
+    }
+  }
+}
+
 export async function scrapeChart(page, url) {
   try {
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+    const success = await safeGoto(page, url);
+    if (!success) {
+      console.error(`❌ Failed to load ${url}`);
+      return ["NAVIGATION FAILED"];
+    }
 
     await page.waitForSelector('[data-name="legend"]', { timeout: 15000 });
 
@@ -26,9 +47,8 @@ export async function scrapeChart(page, url) {
       { timeout: 15000 }
     );
 
-    // Filter and extract values ONLY under the CLUBBED title
     const values = await page.$$eval(
-      '[data-name="legend"] .item-l31H9iuA.study-l31H9iuA', // studies like CLUBBED
+      '[data-name="legend"] .item-l31H9iuA.study-l31H9iuA',
       (studySections) => {
         const clubbed = [...studySections].find((section) => {
           const titleDiv = section.querySelector(
@@ -36,9 +56,7 @@ export async function scrapeChart(page, url) {
           );
           return titleDiv?.innerText?.toLowerCase() === "clubbed";
         });
-
         if (!clubbed) return ["CLUBBED NOT FOUND"];
-
         const valueSpans = clubbed.querySelectorAll(".valueValue-l31H9iuA");
         return [...valueSpans].map((el) => el.innerText.trim());
       }
