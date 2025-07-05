@@ -35,7 +35,10 @@ export async function scrapeChart(page, url) {
           const title = section.querySelector(
             '[data-name="legend-source-title"] .title-l31H9iuA'
           );
-          if (title?.innerText?.toLowerCase() === "clubbed") {
+          if (
+            title?.innerText?.toLowerCase() === "clubbed" ||
+            title?.innerText?.toLowerCase() === "l"
+          ) {
             const values = section.querySelectorAll(".valueValue-l31H9iuA");
             return Array.from(values).some(
               (el) => el.innerText.trim() && el.innerText.trim() !== "∅"

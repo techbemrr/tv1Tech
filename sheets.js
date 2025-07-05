@@ -16,7 +16,7 @@ const sheets = google.sheets({ version: "v4", auth });
 export async function getChartLinks() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.SHEET_ID,
-    range: `${process.env.SOURCE_SHEET}!C2:C`,
+    range: `${process.env.SOURCE_SHEET}!C2109:C`,
   });
   return res.data.values.map(([url]) => url.replace(/"/g, "").trim());
 }

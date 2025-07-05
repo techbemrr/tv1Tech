@@ -58,7 +58,7 @@ async function loadCookies(page) {
   const chartLinks = await getChartLinks();
 
   const batchIndex = parseInt(process.argv[2] || "0", 10);
-  const BATCH_SIZE = 340;
+  const BATCH_SIZE = 35;
   const start = batchIndex * BATCH_SIZE;
   const end = start + BATCH_SIZE;
   const batchLinks = chartLinks.slice(start, end);
