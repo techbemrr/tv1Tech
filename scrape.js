@@ -57,7 +57,8 @@ export async function scrapeChart(page, url) {
           const titleDiv = section.querySelector(
             '[data-name="legend-source-title"] .title-l31H9iuA'
           );
-          return titleDiv?.innerText?.toLowerCase() === "clubbed";
+          const text = titleDiv?.innerText?.toLowerCase();
+          return text === "clubbed" || text === "l";
         });
         if (!clubbed) return ["CLUBBED NOT FOUND"];
         const valueSpans = clubbed.querySelectorAll(".valueValue-l31H9iuA");
