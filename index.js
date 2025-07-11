@@ -112,7 +112,7 @@ async function loadCookies(page) {
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  // Write any remaining rows
+  // Write any remaining rows.
   if (rowBuffer.length > 0) {
     console.log(
       `🧹 Writing remaining ${rowBuffer.length} rows starting from ${
