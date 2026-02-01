@@ -1,57 +1,49 @@
 import fs from 'fs';
-import path from 'path';
-
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function safeGoto(page, url, retries = 3) {
-  // --- 1. SESSION INJECTION ---
+  // 1. Forced Cookie Injection
   try {
     if (fs.existsSync('./cookies.json')) {
-      const cookiesString = fs.readFileSync('./cookies.json', 'utf8');
-      const cookies = JSON.parse(cookiesString);
-      await page.setCookie(...cookies);
-      console.log("[Status] SUCCESS: Cookies loaded.");
+      const cookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
+      const formatted = cookies.map(c => ({
+        ...c,
+        domain: c.domain.startsWith('.') ? c.domain : `.${c.domain}`,
+        sameSite: "Lax"
+      }));
+      await page.setCookie(...formatted);
+      console.log("[Status] SUCCESS: Cookies applied.");
     }
   } catch (err) {
-    console.warn("[Status] Cookie load failed, continuing as guest.");
+    console.warn("[Status] Cookie Injection Error:", err.message);
   }
 
   await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
 
   for (let i = 0; i < retries; i++) {
     try {
-      console.log(`[Status] Navigating: Attempt ${i + 1}`);
-      await page.goto(url, { waitUntil: "load", timeout: 60000 });
+      console.log(`[Status] Navigating Attempt ${i + 1}`);
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-      await killPopups(page);
-
-      // --- 2. LOGIN VERIFICATION & DEBUGGING ---
-      const loginInfo = await page.evaluate(() => {
-        const userBtn = document.querySelector('button[name="header-user-menu-button"], .tv-header__user-menu-button--user');
-        return {
-          isLoggedIn: !!userBtn,
-          currentUrl: window.location.href,
-          bodySnippet: document.body.innerText.substring(0, 100).replace(/\n/g, ' ')
-        };
+      // 2. Verified Login Check
+      const isLoggedIn = await page.evaluate(() => {
+        return !!document.querySelector('button[name="header-user-menu-button"], .tv-header__user-menu-button--user');
       });
 
-      console.log(`[Status] Login Verified: ${loginInfo.isLoggedIn ? "YES ✅" : "NO ❌"}`);
-      
-      if (!loginInfo.isLoggedIn) {
-        console.log(`[Debug] Current URL: ${loginInfo.currentUrl}`);
-        // Take a screenshot so you can see why login failed (e.g., CAPTCHA)
-        await page.screenshot({ path: `debug_login_failed_${i}.png` });
-        console.log(`[Debug] Screenshot saved: debug_login_failed_${i}.png`);
+      console.log(`[Status] Login Verified: ${isLoggedIn ? "YES ✅" : "NO ❌"}`);
+
+      // ⚠️ Take screenshot immediately if login fails
+      if (!isLoggedIn) {
+        const screenshotPath = `login_failed_batch_${Date.now()}.png`;
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`[Debug] Login failed screenshot saved: ${screenshotPath}`);
       }
 
-      // --- 3. FORCE DATA ENGINE ---
       await page.waitForSelector('canvas', { timeout: 20000 });
       
-      // Interaction to wake up "None" values
-      const view = page.viewport();
-      await page.mouse.click(view.width / 2, view.height / 2);
+      // Force interaction to wake up the ∅ values
+      await page.click('[data-qa-id="legend"]').catch(() => {});
       
-      console.log("[Status] Waiting for calculation (digits)...");
       const dataReady = await page.waitForFunction(() => {
         const items = document.querySelectorAll('[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA');
         const target = Array.from(items).find(s => {
@@ -59,21 +51,12 @@ async function safeGoto(page, url, retries = 3) {
           return t === "clubbed" || t === "l";
         });
         if (!target) return false;
+        const firstVal = target.querySelector(".valueValue-l31H9iuA")?.innerText;
+        return /[0-9.-]/.test(firstVal);
+      }, { timeout: 30000, polling: 1000 }).catch(() => false);
 
-        // Force click the title to refresh
-        const title = target.querySelector('.title-l31H9iuA');
-        if (title && !window.doneClick) { title.click(); window.doneClick = true; }
-
-        const vals = Array.from(target.querySelectorAll(".valueValue-l31H9iuA"));
-        return vals.some(v => /[0-9.-]/.test(v.innerText));
-      }, { timeout: 40000, polling: 1000 }).catch(() => false);
-
-      if (dataReady) {
-        console.log("[Status] SUCCESS: Numbers detected.");
-        return true;
-      }
-      
-      console.log("[Status] RETRY: Values stayed ∅.");
+      if (dataReady) return true;
+      console.log("[Status] Values stayed ∅, retrying...");
     } catch (err) {
       console.error(`[Error] ${err.message}`);
     }
@@ -81,22 +64,10 @@ async function safeGoto(page, url, retries = 3) {
   return false;
 }
 
-async function killPopups(page) {
-  try {
-    await page.keyboard.press("Escape");
-    await page.evaluate(() => {
-      const selectors = ['#overlap-manager-root', '[class*="dialog-"]', '.tv-dialog__close', '.modal-backdrop'];
-      selectors.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
-    });
-  } catch (e) {}
-}
-
 export async function scrapeChart(page, url) {
   const COLS = 25;
   try {
-    await page.setViewport({ width: 1920, height: 1080 });
     const success = await safeGoto(page, url);
-
     const now = new Date();
     const dateStr = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
 
@@ -107,17 +78,12 @@ export async function scrapeChart(page, url) {
         const t = i.querySelector('[data-qa-id="legend-source-title"]')?.innerText?.toLowerCase();
         return t === "clubbed" || t === "l";
       });
-      return club ? Array.from(club.querySelectorAll(".valueValue-l31H9iuA")).map(v => v.innerText.trim()) : ["NOT_FOUND"];
+      if (!club) return ["NOT_FOUND"];
+      return Array.from(club.querySelectorAll(".valueValue-l31H9iuA")).map(v => v.innerText.trim());
     });
 
-    const cleanData = data.map(v => (v === "∅" || v === "") ? "None" : v);
-    console.log(`[Status] DATA: ${cleanData.slice(0, 3).join(' | ')}`);
-    return ["", "", dateStr, ...fixedLength(cleanData, COLS - 3)];
+    return ["", "", dateStr, ...data.map(v => (v === "∅" || v === "") ? "None" : v).slice(0, COLS - 3)];
   } catch (err) {
     return ["", "", "ERROR", ...Array(COLS - 3).fill("ERROR")];
   }
-}
-
-function fixedLength(arr, len) {
-  return arr.length >= len ? arr.slice(0, len) : arr.concat(Array(len - arr.length).fill(""));
 }
