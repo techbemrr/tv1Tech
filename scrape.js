@@ -1,5 +1,5 @@
-// ✅ FINAL OPTIMIZED VERSION: Fixes "∅" symbol issue
-// This version waits specifically for numbers to appear in the legend.
+// ✅ FINAL REVISION: Force-Triggering Legend Values
+// This version moves the mouse and clicks to "wake up" the TradingView data engine.
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -13,14 +13,19 @@ async function safeGoto(page, url, retries = 3) {
 
       await killPopups(page);
 
-      // Wait for the Chart Engine
-      await page.waitForFunction(() => {
-        const canvas = document.querySelector('canvas');
-        return canvas && canvas.offsetWidth > 0;
-      }, { timeout: 25000 });
+      // Wait for Chart Engine
+      await page.waitForSelector('canvas', { timeout: 20000 });
 
-      // ✅ KEY FIX: Wait for the legend values to change from '∅' to actual numbers
-      // We check the 'clubbed' or 'l' section specifically
+      // ✅ ACTION: Move mouse to center and click to "activate" the chart
+      const { width, height } = page.viewport();
+      await page.mouse.move(width / 2, height / 2);
+      await page.mouse.click(width / 2, height / 2);
+      
+      // ✅ ACTION: Specifically click near the legend to force calculation
+      await page.click('[data-qa-id="legend"]').catch(() => {});
+
+      // Wait for the legend values to change from '∅' to actual numbers
+      console.log("Waiting for data to calculate...");
       await page.waitForFunction(() => {
         const items = document.querySelectorAll('[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA');
         const target = Array.from(items).find(el => {
@@ -29,10 +34,11 @@ async function safeGoto(page, url, retries = 3) {
         });
         if (!target) return false;
         const firstVal = target.querySelector(".valueValue-l31H9iuA")?.innerText;
-        return firstVal && firstVal !== "∅" && firstVal !== "";
-      }, { timeout: 15000 }).catch(() => console.log("Values still ∅ after wait, attempting extraction anyway."));
+        // Success if value is a number, has a decimal, or is not the null symbol
+        return firstVal && firstVal !== "∅" && firstVal !== "" && /[0-9]/.test(firstVal);
+      }, { timeout: 20000 }).catch(() => console.log("Values still loading, proceeding to grab best available..."));
 
-      await delay(2000); // Final settle time
+      await delay(2000); 
       return true;
     } catch (err) {
       console.warn(`[Warning] Attempt ${i + 1} failed: ${err.message}`);
@@ -69,6 +75,9 @@ export async function scrapeChart(page, url) {
     const now = new Date();
     const dateString = buildDate(now.getDate(), now.getMonth() + 1, now.getFullYear());
 
+    // Final check for popups that might have appeared after clicking the chart
+    await killPopups(page);
+
     const values = await page.$$eval(
       '[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA',
       (sections) => {
@@ -81,7 +90,6 @@ export async function scrapeChart(page, url) {
         if (!target) return ["INDICATOR NOT FOUND"];
 
         const spans = target.querySelectorAll(".valueValue-l31H9iuA");
-        // Convert to array and filter out the '∅' if it somehow still exists
         return [...spans].map(s => {
             const val = s.innerText.trim();
             return val === "∅" ? "None" : val;
@@ -89,7 +97,7 @@ export async function scrapeChart(page, url) {
       }
     );
 
-    console.log(`[Success] Scraped: ${values.join(' | ')}`);
+    console.log(`[Success] Scraped: ${values.slice(0, 5).join(' | ')} ...`);
     return ["", "", dateString, ...fixedLength(values, EXPECTED_VALUE_COUNT - 1)];
 
   } catch (err) {
