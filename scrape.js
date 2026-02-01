@@ -1,58 +1,72 @@
-// ✅ FINAL CALCULATION FIX: Forcing Technical Analysis Engine to Run
+// ✅ REVISED VERSION: With Step-by-Step Status Logs & Cookie Validation
 
+const fs = require('fs');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function safeGoto(page, url, retries = 3) {
+  // 1. Check if Cookies are applied
+  try {
+    const cookiesString = fs.readFileSync('./cookies.json', 'utf8');
+    const cookies = JSON.parse(cookiesString);
+    await page.setCookie(...cookies);
+    console.log("[Status] Cookies loaded from cookies.json");
+  } catch (err) {
+    console.warn("[Status] No cookies.json found or failed to load. Proceeding as Guest.");
+  }
+
   await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
-  
+
   for (let i = 0; i < retries; i++) {
     try {
-      console.log(`[Navigation] Attempt ${i + 1}: ${url}`);
+      console.log(`[Status] Navigating to link (Attempt ${i + 1})...`);
       await page.goto(url, { waitUntil: "load", timeout: 60000 });
+
+      // 2. Check Login Status
+      const isLoggedIn = await page.evaluate(() => {
+        return !document.querySelector('button[name="header-user-menu-button"]') && 
+               !document.querySelector('.tv-header__user-menu-button--anonymous');
+      });
+      console.log(`[Status] User Session Active: ${isLoggedIn ? "YES" : "NO (Guest Mode)"}`);
 
       await killPopups(page);
 
-      // 1. Wait for Chart
-      await page.waitForSelector('canvas', { timeout: 30000 });
+      // 3. Wait for Canvas
+      await page.waitForSelector('canvas', { timeout: 20000 });
+      console.log("[Status] Chart Canvas Detected.");
 
-      // 2. FORCE RE-RENDER: TradingView often freezes studies in headless mode.
-      // We simulate a window resize and a mouse "scrub" across the chart.
-      await page.setViewport({ width: 1921, height: 1081 }); // Trigger resize
+      // 4. Force Activation (Resize & Move)
+      await page.setViewport({ width: 1921, height: 1081 });
       await delay(500);
       await page.setViewport({ width: 1920, height: 1080 });
       
       const view = page.viewport();
       await page.mouse.move(view.width / 2, view.height / 2);
-      await page.mouse.down();
-      await page.mouse.move(view.width / 2 + 50, view.height / 2); // Small drag
-      await page.mouse.up();
+      await page.mouse.click(view.width / 2, view.height / 2);
+      console.log("[Status] Chart Engine Activated (Simulated Interaction).");
 
-      console.log("Waiting for values to calculate (Avoid ∅)...");
-      
-      // 3. Wait specifically for a number to appear in the study legend
+      // 5. Wait for numbers
+      console.log("[Status] Waiting for Indicator values to calculate...");
       const dataLoaded = await page.waitForFunction(() => {
         const studies = document.querySelectorAll('[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA');
         const clubbed = Array.from(studies).find(s => {
           const title = s.querySelector('[data-qa-id="legend-source-title"] .title-l31H9iuA')?.innerText?.toLowerCase();
           return title === "clubbed" || title === "l";
         });
-        
         if (!clubbed) return false;
-        
         const firstVal = clubbed.querySelector(".valueValue-l31H9iuA")?.innerText || "";
-        // Check if it's a number, a decimal point, or a minus sign (ignores ∅ and n/a)
         return /[0-9.-]/.test(firstVal);
-      }, { timeout: 35000, polling: 1000 }).catch(() => false);
+      }, { timeout: 30000, polling: 1000 }).catch(() => false);
 
-      if (!dataLoaded && i < retries - 1) {
-        console.warn("Values stayed ∅. Retrying with full reload...");
-        continue; 
+      if (!dataLoaded) {
+        console.warn("[Status] Values stayed ∅. Retrying logic...");
+        if (i < retries - 1) continue;
+      } else {
+        console.log("[Status] Data Calculation Success!");
       }
 
       return true;
     } catch (err) {
-      console.warn(`[Warning] Attempt ${i + 1} failed: ${err.message}`);
-      await killPopups(page).catch(() => {});
+      console.warn(`[Status] Error: ${err.message}`);
       if (i === retries - 1) return false;
       await delay(5000);
     }
@@ -63,9 +77,7 @@ async function killPopups(page) {
   try {
     await page.keyboard.press("Escape");
     await page.evaluate(() => {
-      document.documentElement.style.setProperty("overflow", "auto", "important");
-      document.body.style.setProperty("overflow", "auto", "important");
-      const blockers = ['#overlap-manager-root', '[class*="overlap-manager"]', '[class*="dialog-"]', '.tv-dialog__close', '.js-dialog__close', 'button[name="close"]', '.modal-backdrop'];
+      const blockers = ['#overlap-manager-root', '[class*="overlap-manager"]', '[class*="dialog-"]', '.tv-dialog__close', '.js-dialog__close', '.modal-backdrop'];
       document.querySelectorAll(blockers.join(',')).forEach(el => el.remove());
     });
   } catch (e) {}
@@ -82,7 +94,6 @@ export async function scrapeChart(page, url) {
       return ["", "", ...fixedLength(["NAVIGATION FAILED"], EXPECTED_VALUE_COUNT)];
     }
 
-    await delay(1000); // Tiny wait to let all 25 values sync
     const now = new Date();
     const dateString = buildDate(now.getDate(), now.getMonth() + 1, now.getFullYear());
 
@@ -105,11 +116,11 @@ export async function scrapeChart(page, url) {
       }
     );
 
-    console.log(`[Success] First 3 values: ${values.slice(0, 3).join(', ')}`);
+    console.log(`[Status] Extraction Complete. Values: ${values.slice(0, 3).join(', ')}...`);
     return ["", "", dateString, ...fixedLength(values, EXPECTED_VALUE_COUNT - 1)];
 
   } catch (err) {
-    console.error(`[Fatal] Error:`, err.message);
+    console.error(`[Status] Scrape Error:`, err.message);
     return ["", "", ...fixedLength(["ERROR"], EXPECTED_VALUE_COUNT)];
   }
 }
