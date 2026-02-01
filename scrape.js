@@ -1,71 +1,85 @@
-// ✅ Complete Drop-in Replacement
-// Fixes "Navigation Failed" by ignoring heavy background assets and forcing a desktop view
+// ✅ COMPLETE UPDATE: High-Resilience Scraping for TradingView
+// This version includes a "Page Ready" check and handles the canvas rendering delay.
 
 async function safeGoto(page, url, retries = 3) {
-  // Set a standard desktop User-Agent to avoid bot detection
-  await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+  // 1. Force a real-world User Agent
+  await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
   
+  // 2. Extra Headers to look more like a browser
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+  });
+
   for (let i = 0; i < retries; i++) {
     try {
-      // 1. "domcontentloaded" is safer than "networkidle" for TradingView
-      // Reduced timeout to 30s to fail fast and retry rather than hanging
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      console.log(`--- Navigating to: ${url} (Attempt ${i+1}) ---`);
+      
+      // Use 'load' instead of 'domcontentloaded' to ensure the JS engine starts
+      await page.goto(url, { waitUntil: "load", timeout: 60000 });
 
-      // 2. Kill popups immediately
+      // Immediate kill of common blocking overlays
       await killPopups(page);
 
-      // 3. Wait for the chart engine to actually start (the Canvas)
-      // This is more reliable than waiting for the legend
-      await page.waitForSelector('canvas.chart-gui-wrapper', { timeout: 15000 });
+      // ✅ CHANGE: Wait for ANY canvas first, then specifically the chart wrapper
+      // Some TV layouts load different canvas classes
+      await page.waitForFunction(() => {
+        const c = document.querySelector('canvas');
+        return c && c.offsetWidth > 0;
+      }, { timeout: 20000 });
 
-      // 4. Brief pause for SPA elements to settle
-      await page.waitForTimeout(2000);
+      // Small buffer for the legend to populate values
+      await page.waitForTimeout(3000);
+      
+      // Final sweep
       await killPopups(page);
 
       return true;
     } catch (err) {
-      console.warn(`Attempt ${i + 1} failed for ${url}: ${err.message}`);
+      console.warn(`Attempt ${i + 1} failed: ${err.message}`);
+      // If we see a popup, try to kill it even during failure
+      await killPopups(page).catch(() => {});
       if (i === retries - 1) return false;
-      // Wait before retry
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 5000));
     }
   }
 }
 
 async function killPopups(page) {
   try {
-    // Spam Escape key to close native TV dialogs
-    for (let k = 0; k < 3; k++) {
-      await page.keyboard.press("Escape");
-    }
+    // Escape key is the most effective tool against TradingView modals
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
 
     await page.evaluate(() => {
-      // Force scrollability
-      document.documentElement.style.setProperty("overflow", "auto", "important");
-      document.body.style.setProperty("overflow", "auto", "important");
+      // 1. Unlock Scroll
+      document.documentElement.style.overflow = "auto";
+      document.body.style.overflow = "auto";
 
-      // Specific TradingView Overlay IDs/Classes
-      const blockers = [
-        '#overlap-manager-root', 
-        '.tv-dialog__close', 
+      // 2. List of elements that TradingView uses to block the UI
+      const blockerSelectors = [
+        'div[id^="overlap-manager-root"]',
+        '.tv-dialog__close',
         '.js-dialog__close',
-        '[data-name="close"]',
+        'button[name="close"]',
+        '[data-role="toast-container"]',
+        '.modal-backdrop',
+        '#overlap-manager-root',
         '[class*="overlap-manager"]',
         '[class*="dialog-"]',
-        '.modal-backdrop'
+        '[class*="overlay-"]'
       ];
 
-      blockers.forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => el.remove());
+      blockerSelectors.forEach(selector => {
+        document.querySelectorAll(selector).forEach(el => {
+          el.style.display = 'none'; // Hide it
+          el.remove();               // Then delete it
+        });
       });
 
-      // Remove any fixed full-screen divs that aren't the chart
-      document.querySelectorAll('div').forEach(div => {
-        const style = window.getComputedStyle(div);
-        if (style.position === 'fixed' && parseInt(style.zIndex) > 100) {
-          if (!div.querySelector('canvas')) div.remove();
-        }
-      });
+      // 3. Click "Accept" if a cookie banner is found
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const acceptBtn = buttons.find(b => b.innerText.includes('Accept') || b.innerText.includes('Agree'));
+      if (acceptBtn) acceptBtn.click();
     });
   } catch (e) {}
 }
@@ -74,7 +88,7 @@ export async function scrapeChart(page, url) {
   const EXPECTED_VALUE_COUNT = 25;
 
   try {
-    // Ensure viewport is large enough to render the legend
+    // TradingView needs a wide screen to show the legend values
     await page.setViewport({ width: 1920, height: 1080 });
     
     const success = await safeGoto(page, url);
@@ -83,42 +97,38 @@ export async function scrapeChart(page, url) {
       return ["", "", ...fixedLength(["NAVIGATION FAILED"], EXPECTED_VALUE_COUNT)];
     }
 
-    // Final clean before extraction
-    await killPopups(page);
-
     const now = new Date();
     const dateString = buildDate(now.getDate(), now.getMonth() + 1, now.getFullYear());
 
-    // Wait for the specific legend item to be visible
-    await page.waitForSelector('[data-qa-id="legend"]', { timeout: 10000 });
-
+    // Extracting the data
     const values = await page.$$eval(
       '[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA',
       (sections) => {
-        const target = [...sections].find((section) => {
-          const title = section.querySelector('[data-qa-id="legend-source-title"] .title-l31H9iuA');
-          const text = title?.innerText?.trim().toLowerCase();
-          return text === "clubbed" || text === "l";
+        // Find the specific section with title 'clubbed' or 'l'
+        const targetSection = [...sections].find((section) => {
+          const titleEl = section.querySelector('[data-qa-id="legend-source-title"] .title-l31H9iuA');
+          const titleText = titleEl?.innerText?.trim().toLowerCase();
+          return titleText === "clubbed" || titleText === "l";
         });
 
-        if (!target) return ["CLUBBED NOT FOUND"];
+        if (!targetSection) return ["INDICATOR NOT FOUND"];
 
-        const valueSpans = target.querySelectorAll(".valueValue-l31H9iuA");
-        return [...valueSpans].map((el) => {
-          const t = el.innerText.trim();
-          return t === "∅" || t === "" ? "None" : t;
-        });
+        const spans = targetSection.querySelectorAll(".valueValue-l31H9iuA");
+        const data = [...spans].map(s => s.innerText.trim());
+        return data.length > 0 ? data : ["NO VALUES"];
       }
     );
 
+    console.log(`Successfully scraped: ${url}`);
     return ["", "", dateString, ...fixedLength(values, EXPECTED_VALUE_COUNT - 1)];
+
   } catch (err) {
-    console.error(`Scrape Error: ${err.message}`);
+    console.error(`Error on ${url}:`, err.message);
     return ["", "", ...fixedLength(["ERROR"], EXPECTED_VALUE_COUNT)];
   }
 }
 
-// Support functions
+// Helpers
 function fixedLength(arr, len, fill = "") {
   if (arr.length >= len) return arr.slice(0, len);
   return arr.concat(Array(len - arr.length).fill(fill));
