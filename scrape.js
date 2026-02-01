@@ -1,64 +1,48 @@
-// ✅ UPDATED VERSION: Enhanced Cookie Application & Force Calculation
-
 import fs from 'fs';
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function safeGoto(page, url, retries = 3) {
-  // 1. Precise Cookie Loading
+  // 1. Load Cookies from your login.js output
   try {
     if (fs.existsSync('./cookies.json')) {
       const cookiesString = fs.readFileSync('./cookies.json', 'utf8');
-      let cookies = JSON.parse(cookiesString);
-      
-      // Ensure cookies are formatted for the TradingView domain
-      const formattedCookies = cookies.map(c => ({
-        ...c,
-        domain: c.domain || '.tradingview.com',
-        path: c.path || '/'
-      }));
-      
-      await page.setCookie(...formattedCookies);
+      const cookies = JSON.parse(cookiesString);
+      await page.setCookie(...cookies);
       console.log("[Status] SUCCESS: Cookies applied to session.");
     }
   } catch (err) {
-    console.warn("[Status] ERROR: Cookie application failed:", err.message);
+    console.warn("[Status] Cookie load skipped/failed.");
   }
 
   await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
 
   for (let i = 0; i < retries; i++) {
     try {
-      console.log(`[Status] Navigating: Attempt ${i + 1}`);
+      console.log(`[Status] Navigating: Attempt ${i + 1} for ${url}`);
       await page.goto(url, { waitUntil: "load", timeout: 60000 });
 
-      // 2. Verified Login Check (More robust selectors)
-      const loginData = await page.evaluate(() => {
-        const userBtn = document.querySelector('button[name="header-user-menu-button"], .tv-header__user-menu-button--user, [data-name="header-user-menu-button"]');
-        return {
-          isLoggedIn: !!userBtn,
-          htmlSnippet: userBtn ? "User Button Found" : "Not Found"
-        };
-      });
-      console.log(`[Status] Login Verified: ${loginData.isLoggedIn ? "YES" : "NO (Guest Mode)"}`);
-
+      // 2. Kill Popups
       await killPopups(page);
 
-      // 3. Chart Activation
+      // 3. Verify Login
+      const isLoggedIn = await page.evaluate(() => {
+        return !!document.querySelector('button[name="header-user-menu-button"]') || 
+               !!document.querySelector('.tv-header__user-menu-button--user');
+      });
+      console.log(`[Status] Login Verified: ${isLoggedIn ? "YES" : "NO (Guest Mode)"}`);
+
+      // 4. Force Chart to wake up
       await page.waitForSelector('canvas', { timeout: 20000 });
       
-      // Force a "Click" on the indicator legend to wake up the engine
+      // Click the Legend area specifically to focus the study engine
       await page.click('[data-qa-id="legend"]').catch(() => {});
       
-      // Interaction Simulation
-      await page.setViewport({ width: 1921, height: 1081 });
-      await delay(500);
-      await page.setViewport({ width: 1920, height: 1080 });
-      
+      // Simulate activity
       const view = page.viewport();
+      await page.mouse.move(view.width / 2, view.height / 2);
       await page.mouse.click(view.width / 2, view.height / 2);
-      console.log("[Status] Chart Engine: Activated");
-
-      // 4. Wait for Data Calculation
+      
+      // 5. Wait for specific calculation
       console.log("[Status] Calculating Indicator Values...");
       const dataReady = await page.waitForFunction(() => {
         const studies = document.querySelectorAll('[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA');
@@ -68,23 +52,26 @@ async function safeGoto(page, url, retries = 3) {
         });
         if (!clubbed) return false;
         
-        // Look for any of the value spans to contain a number
+        // Try to click the study title inside the browser to force it to refresh
+        const titleEl = clubbed.querySelector('.title-l31H9iuA');
+        if (titleEl && !window.hasClicked) {
+            titleEl.click();
+            window.hasClicked = true; 
+        }
+
         const vals = Array.from(clubbed.querySelectorAll(".valueValue-l31H9iuA"));
         return vals.some(v => /[0-9.-]/.test(v.innerText));
       }, { timeout: 35000, polling: 1000 }).catch(() => false);
 
       if (!dataReady) {
-        console.log("[Status] Calculation Failure: Values timed out.");
-        if (i < retries - 1) {
-            console.log("[Status] Retrying entire navigation...");
-            continue;
-        }
+        console.log("[Status] Data stayed ∅. Retrying...");
+        if (i < retries - 1) continue;
       } else {
         console.log("[Status] Calculation: SUCCESS");
         return true;
       }
     } catch (err) {
-      console.error(`[Status] Navigation Error: ${err.message}`);
+      console.error(`[Status] Error: ${err.message}`);
       if (i === retries - 1) return false;
       await delay(5000);
     }
@@ -132,10 +119,10 @@ export async function scrapeChart(page, url) {
       }
     );
 
-    console.log(`[Status] Scraped successfully: ${values[0]}`);
+    console.log(`[Status] Scraped: ${values[0]}...`);
     return ["", "", dateString, ...fixedLength(values, EXPECTED_VALUE_COUNT - 1)];
   } catch (err) {
-    console.error(`[Status] Fatal Error:`, err.message);
+    console.error(`[Status] Fatal:`, err.message);
     return ["", "", ...fixedLength(["ERROR"], EXPECTED_VALUE_COUNT)];
   }
 }
