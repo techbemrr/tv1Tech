@@ -1,57 +1,64 @@
-// ✅ ES MODULE VERSION: Fixed "require is not defined" error
-// Optimized for GitHub Actions with Step-by-Step Status Logging
+// ✅ UPDATED VERSION: Enhanced Cookie Application & Force Calculation
 
 import fs from 'fs';
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function safeGoto(page, url, retries = 3) {
-  // 1. Validate and Load Cookies
+  // 1. Precise Cookie Loading
   try {
     if (fs.existsSync('./cookies.json')) {
       const cookiesString = fs.readFileSync('./cookies.json', 'utf8');
-      const cookies = JSON.parse(cookiesString);
-      await page.setCookie(...cookies);
-      console.log("[Status] SUCCESS: Cookies loaded from cookies.json");
-    } else {
-      console.log("[Status] INFO: No cookies.json found. Proceeding as Guest.");
+      let cookies = JSON.parse(cookiesString);
+      
+      // Ensure cookies are formatted for the TradingView domain
+      const formattedCookies = cookies.map(c => ({
+        ...c,
+        domain: c.domain || '.tradingview.com',
+        path: c.path || '/'
+      }));
+      
+      await page.setCookie(...formattedCookies);
+      console.log("[Status] SUCCESS: Cookies applied to session.");
     }
   } catch (err) {
-    console.warn("[Status] WARNING: Failed to parse cookies.json.");
+    console.warn("[Status] ERROR: Cookie application failed:", err.message);
   }
 
-  // Set real-world headers
   await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
 
   for (let i = 0; i < retries; i++) {
     try {
-      console.log(`[Status] Navigating: Attempt ${i + 1} for ${url}`);
+      console.log(`[Status] Navigating: Attempt ${i + 1}`);
       await page.goto(url, { waitUntil: "load", timeout: 60000 });
 
-      // 2. Check Login State
-      const isLoggedIn = await page.evaluate(() => {
-        // Look for the user profile button instead of the "Sign In" button
-        return !!document.querySelector('button[name="header-user-menu-button"]') || 
-               !!document.querySelector('.tv-header__user-menu-button--user');
+      // 2. Verified Login Check (More robust selectors)
+      const loginData = await page.evaluate(() => {
+        const userBtn = document.querySelector('button[name="header-user-menu-button"], .tv-header__user-menu-button--user, [data-name="header-user-menu-button"]');
+        return {
+          isLoggedIn: !!userBtn,
+          htmlSnippet: userBtn ? "User Button Found" : "Not Found"
+        };
       });
-      console.log(`[Status] Login Verified: ${isLoggedIn ? "YES (Authenticated)" : "NO (Guest Mode)"}`);
+      console.log(`[Status] Login Verified: ${loginData.isLoggedIn ? "YES" : "NO (Guest Mode)"}`);
 
       await killPopups(page);
 
-      // 3. Wait for Chart Engine
+      // 3. Chart Activation
       await page.waitForSelector('canvas', { timeout: 20000 });
-      console.log("[Status] Chart Engine: Loaded");
-
-      // 4. Force Activation (Simulation)
+      
+      // Force a "Click" on the indicator legend to wake up the engine
+      await page.click('[data-qa-id="legend"]').catch(() => {});
+      
+      // Interaction Simulation
       await page.setViewport({ width: 1921, height: 1081 });
       await delay(500);
       await page.setViewport({ width: 1920, height: 1080 });
       
       const view = page.viewport();
-      await page.mouse.move(view.width / 2, view.height / 2);
       await page.mouse.click(view.width / 2, view.height / 2);
-      console.log("[Status] Interaction: Chart Activated");
+      console.log("[Status] Chart Engine: Activated");
 
-      // 5. Wait for Data Calculation
+      // 4. Wait for Data Calculation
       console.log("[Status] Calculating Indicator Values...");
       const dataReady = await page.waitForFunction(() => {
         const studies = document.querySelectorAll('[data-qa-id="legend"] .item-l31H9iuA.study-l31H9iuA');
@@ -60,15 +67,20 @@ async function safeGoto(page, url, retries = 3) {
           return title === "clubbed" || title === "l";
         });
         if (!clubbed) return false;
-        const firstVal = clubbed.querySelector(".valueValue-l31H9iuA")?.innerText || "";
-        return /[0-9.-]/.test(firstVal); // True if it contains a digit
-      }, { timeout: 30000, polling: 1000 }).catch(() => false);
+        
+        // Look for any of the value spans to contain a number
+        const vals = Array.from(clubbed.querySelectorAll(".valueValue-l31H9iuA"));
+        return vals.some(v => /[0-9.-]/.test(v.innerText));
+      }, { timeout: 35000, polling: 1000 }).catch(() => false);
 
       if (!dataReady) {
-        console.log("[Status] Data Failure: Values stayed ∅. Retrying...");
-        if (i < retries - 1) continue;
+        console.log("[Status] Calculation Failure: Values timed out.");
+        if (i < retries - 1) {
+            console.log("[Status] Retrying entire navigation...");
+            continue;
+        }
       } else {
-        console.log("[Status] Calculation: Success");
+        console.log("[Status] Calculation: SUCCESS");
         return true;
       }
     } catch (err) {
@@ -85,20 +97,18 @@ async function killPopups(page) {
     await page.evaluate(() => {
       const selectors = ['#overlap-manager-root', '[class*="overlap-manager"]', '[class*="dialog-"]', '.tv-dialog__close', '.js-dialog__close', '.modal-backdrop'];
       document.querySelectorAll(selectors.join(',')).forEach(el => el.remove());
-      document.body.style.overflow = 'auto';
     });
   } catch (e) {}
 }
 
 export async function scrapeChart(page, url) {
   const EXPECTED_VALUE_COUNT = 25;
-
   try {
     await page.setViewport({ width: 1920, height: 1080 });
     const success = await safeGoto(page, url);
 
     if (!success) {
-      return ["", "", ...fixedLength(["NAVIGATION FAILED"], EXPECTED_VALUE_COUNT)];
+      return ["", "", ...fixedLength(["FAILED"], EXPECTED_VALUE_COUNT)];
     }
 
     const now = new Date();
@@ -113,8 +123,7 @@ export async function scrapeChart(page, url) {
           return text === "clubbed" || text === "l";
         });
 
-        if (!target) return ["INDICATOR NOT FOUND"];
-
+        if (!target) return ["NOT_FOUND"];
         const spans = target.querySelectorAll(".valueValue-l31H9iuA");
         return [...spans].map(s => {
           const val = s.innerText.trim();
@@ -123,9 +132,8 @@ export async function scrapeChart(page, url) {
       }
     );
 
-    console.log(`[Status] Row Success: ${values[0]}, ${values[1]}...`);
+    console.log(`[Status] Scraped successfully: ${values[0]}`);
     return ["", "", dateString, ...fixedLength(values, EXPECTED_VALUE_COUNT - 1)];
-
   } catch (err) {
     console.error(`[Status] Fatal Error:`, err.message);
     return ["", "", ...fixedLength(["ERROR"], EXPECTED_VALUE_COUNT)];
