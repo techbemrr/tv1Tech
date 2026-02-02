@@ -65,13 +65,12 @@ async function safeGoto(page, url, retries = 3) {
 
       await killPopups(page);
 
-      // wait for chart canvas
       await page.waitForFunction(() => {
         const c = document.querySelector("canvas");
         return c && c.offsetWidth > 0 && c.offsetHeight > 0;
       }, { timeout: 25000 });
 
-      await delay(2500);
+      await delay(2000);
       await killPopups(page);
 
       return true;
@@ -86,10 +85,12 @@ async function safeGoto(page, url, retries = 3) {
 
 export async function scrapeChart(page, url) {
   const EXPECTED_VALUE_COUNT = 25;
-
   const now = new Date();
   const month = two(now.getMonth() + 1);
   const day = two(now.getDate());
+
+  const INDICATOR_NAME = String(process.env.INDICATOR_NAME || "").trim().toLowerCase();
+  const INDICATOR_PARTIAL = INDICATOR_NAME.length > 0;
 
   try {
     await page.setViewport({ width: 1920, height: 1080 });
@@ -105,32 +106,49 @@ export async function scrapeChart(page, url) {
 
     await page.waitForSelector('[data-qa-id="legend"]', { timeout: 20000 });
 
-    const values = await page.$$eval('[data-qa-id="legend"]', (legends) => {
-      const legend = legends[0];
-      if (!legend) return ["LEGEND NOT FOUND"];
-
-      const titleNodes = Array.from(
-        legend.querySelectorAll('[data-qa-id="legend-source-title"]')
+    const values = await page.$eval('[data-qa-id="legend"]', (legend, meta) => {
+      // get all legend items that represent studies/indicators
+      const items = Array.from(
+        legend.querySelectorAll('[class*="item"][class*="study"], [class*="study"]')
       );
 
-      const titleNode = titleNodes.find((n) => {
-        const txt = (n.innerText || "").trim().toLowerCase();
-        return txt.includes("clubbed"); // ✅ put your indicator keyword here
-      });
+      const pickValuesFromItem = (item) => {
+        const spans = Array.from(item.querySelectorAll('[class*="valueValue"]'));
+        const out = spans.map((s) => (s.innerText || "").trim()).filter(Boolean);
+        return out;
+      };
 
-      const container =
-        (titleNode && (titleNode.closest('[class*="item"]') || titleNode.parentElement)) || null;
+      const getTitle = (item) => {
+        const tEl = item.querySelector('[data-qa-id="legend-source-title"]');
+        return (tEl?.innerText || "").trim().toLowerCase();
+      };
 
-      if (!container) return ["INDICATOR NOT FOUND"];
+      // 1) Try match indicator name (if provided)
+      if (meta.indicatorPartial) {
+        for (const item of items) {
+          const title = getTitle(item);
+          if (title && title.includes(meta.indicatorName)) {
+            const out = pickValuesFromItem(item);
+            if (out.length) return out;
+          }
+        }
+      }
 
-      const spans = Array.from(container.querySelectorAll('[class*="valueValue"]'));
-      const out = spans.map((s) => (s.innerText || "").trim()).filter(Boolean);
+      // 2) Fallback: first item that has any values
+      for (const item of items) {
+        const out = pickValuesFromItem(item);
+        if (out.length) return out;
+      }
 
-      return out.length ? out : ["NO VALUES"];
-    });
+      // 3) If no study items, try any value nodes inside legend
+      const any = Array.from(legend.querySelectorAll('[class*="valueValue"]'))
+        .map((n) => (n.innerText || "").trim())
+        .filter(Boolean);
+
+      return any.length ? any : ["NO VALUES IN LEGEND"];
+    }, { indicatorName: INDICATOR_NAME, indicatorPartial: INDICATOR_PARTIAL });
 
     console.log(`[Success] Scraped ${values.length} values from ${url}`);
-
     return [month, day, ...fixedLength(values, EXPECTED_VALUE_COUNT)];
   } catch (err) {
     return [month, day, ...fixedLength([`ERROR: ${err.message}`], EXPECTED_VALUE_COUNT)];
