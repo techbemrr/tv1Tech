@@ -7,7 +7,6 @@ import { getChartLinks, writeBulkWithRetry } from "./sheets.js";
 const COOKIE_PATH = "./cookies.json";
 const TV_HOME = "https://www.tradingview.com/";
 
-// normalize URLs so cookie domain matches
 function normalizeTvUrl(url) {
   if (!url) return url;
   return url.replace("https://in.tradingview.com", "https://www.tradingview.com");
@@ -26,15 +25,19 @@ async function saveCookies(cookies) {
 async function loadCookies(page) {
   if (!fs.existsSync(COOKIE_PATH)) return false;
 
-  // ✅ MUST have a domain context before setCookie
-  await page.goto(TV_HOME, { waitUntil: "domcontentloaded" });
+  // ✅ MUST visit domain before setCookie
+  await page.goto(TV_HOME, { waitUntil: "domcontentloaded", timeout: 60000 });
 
   const cookies = JSON.parse(fs.readFileSync(COOKIE_PATH, "utf-8"));
   await page.setCookie(...cookies);
 
-  // ✅ reload once so cookies apply to session properly
-  await page.goto(TV_HOME, { waitUntil: "domcontentloaded" });
+  // ✅ reload once so cookies take effect
+  await page.goto(TV_HOME, { waitUntil: "domcontentloaded", timeout: 60000 });
   return true;
+}
+
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 (async () => {
@@ -46,7 +49,6 @@ async function loadCookies(page) {
   const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
 
   const accountLinks = chartLinks.slice(ACCOUNT_START, ACCOUNT_END);
-
   const start = BATCH_INDEX * BATCH_SIZE;
   const end = start + BATCH_SIZE;
   const batchLinks = accountLinks.slice(start, end);
@@ -56,15 +58,19 @@ async function loadCookies(page) {
 
   const browser = await puppeteer.launch({
     headless: "new",
-    slowMo: 50,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    slowMo: 0,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
   });
 
   let page = await browser.newPage();
 
-  // ✅ Always visit TV first so cookies bind correctly
-  await page.goto(TV_HOME, { waitUntil: "domcontentloaded" });
+  // ✅ set UA once
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
 
+  // ✅ apply cookies OR login
   const hasCookies = await loadCookies(page);
   if (!hasCookies) {
     try {
@@ -88,38 +94,49 @@ async function loadCookies(page) {
     console.log(`Scraping Row ${globalIndex + 2}: ${url}`);
 
     try {
-      const values = await scrapeChart(page, url);
-      const month = values[0];
-      const day = values[1];
+      // scrapeChart returns: [month, day, ...indicatorValues]
+      const scraped = await scrapeChart(page, url);
+
+      const month = scraped[0];
+      const day = scraped[1];
+      const indicatorValues = scraped.slice(2);
+
+      // ✅ your fixed year
       const date = `${day}/${month}/2025`;
-      const rowData = [date, ...values];
+
+      const rowData = [date, ...indicatorValues];
 
       if (rowBuffer.length === 0) startRow = globalIndex;
       rowBuffer.push(rowData);
 
+      // ✅ Write in bulk every 10 rows
       if (rowBuffer.length === 10) {
         await writeBulkWithRetry(startRow, rowBuffer);
         rowBuffer = [];
         startRow = -1;
       }
-
-      await new Promise((r) => setTimeout(r, 1000));
     } catch (err) {
       console.error(`Error scraping ${url}:`, err.message);
     }
 
+    // restart page every 100 rows
     if ((i + 1) % 100 === 0) {
       console.log("Restarting page to clear memory...");
       await page.close();
       page = await browser.newPage();
+      await page.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+      );
+      await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
 
-      // ✅ Re-apply cookies correctly after new page
+      // ✅ MUST reapply cookies correctly on new page
       await loadCookies(page);
     }
 
-    await new Promise((r) => setTimeout(r, 500));
+    await delay(700);
   }
 
+  // write remaining
   if (rowBuffer.length > 0) {
     console.log(`🧹 Writing remaining ${rowBuffer.length} rows starting from ${startRow + 2}`);
     await writeBulkWithRetry(startRow, rowBuffer);
