@@ -5,11 +5,16 @@ import { scrapeChart } from "./scrape.js";
 import { getChartLinks, writeBulkWithRetry } from "./sheets.js";
 
 const COOKIE_PATH = "./cookies.json";
+const TV_HOME = "https://www.tradingview.com/";
+
+// normalize URLs so cookie domain matches
+function normalizeTvUrl(url) {
+  if (!url) return url;
+  return url.replace("https://in.tradingview.com", "https://www.tradingview.com");
+}
 
 if (process.env.COOKIES_BASE64 && !fs.existsSync(COOKIE_PATH)) {
-  const decoded = Buffer.from(process.env.COOKIES_BASE64, "base64").toString(
-    "utf-8"
-  );
+  const decoded = Buffer.from(process.env.COOKIES_BASE64, "base64").toString("utf-8");
   fs.writeFileSync(COOKIE_PATH, decoded);
   console.log("cookies.json restored from Base64");
 }
@@ -19,26 +24,25 @@ async function saveCookies(cookies) {
 }
 
 async function loadCookies(page) {
-  if (fs.existsSync(COOKIE_PATH)) {
-    const cookies = JSON.parse(fs.readFileSync(COOKIE_PATH));
-    await page.setCookie(...cookies);
-    return true;
-  }
-  return false;
+  if (!fs.existsSync(COOKIE_PATH)) return false;
+
+  // ✅ MUST have a domain context before setCookie
+  await page.goto(TV_HOME, { waitUntil: "domcontentloaded" });
+
+  const cookies = JSON.parse(fs.readFileSync(COOKIE_PATH, "utf-8"));
+  await page.setCookie(...cookies);
+
+  // ✅ reload once so cookies apply to session properly
+  await page.goto(TV_HOME, { waitUntil: "domcontentloaded" });
+  return true;
 }
 
 (async () => {
   const chartLinks = await getChartLinks();
 
-  const BATCH_INDEX = parseInt(
-    process.argv[2] || process.env.BATCH_INDEX || "0",
-    10
-  );
+  const BATCH_INDEX = parseInt(process.argv[2] || process.env.BATCH_INDEX || "0", 10);
   const ACCOUNT_START = parseInt(process.env.ACCOUNT_START || "0", 10);
-  const ACCOUNT_END = parseInt(
-    process.env.ACCOUNT_END || chartLinks.length.toString(),
-    10
-  );
+  const ACCOUNT_END = parseInt(process.env.ACCOUNT_END || chartLinks.length.toString(), 10);
   const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
 
   const accountLinks = chartLinks.slice(ACCOUNT_START, ACCOUNT_END);
@@ -58,6 +62,9 @@ async function loadCookies(page) {
 
   let page = await browser.newPage();
 
+  // ✅ Always visit TV first so cookies bind correctly
+  await page.goto(TV_HOME, { waitUntil: "domcontentloaded" });
+
   const hasCookies = await loadCookies(page);
   if (!hasCookies) {
     try {
@@ -74,7 +81,7 @@ async function loadCookies(page) {
   let startRow = -1;
 
   for (let i = 0; i < batchLinks.length; i++) {
-    const url = batchLinks[i];
+    let url = normalizeTvUrl(batchLinks[i]);
     if (!url) continue;
 
     const globalIndex = ACCOUNT_START + BATCH_INDEX * BATCH_SIZE + i;
@@ -90,7 +97,6 @@ async function loadCookies(page) {
       if (rowBuffer.length === 0) startRow = globalIndex;
       rowBuffer.push(rowData);
 
-      // Write in bulk every 10 rows
       if (rowBuffer.length === 10) {
         await writeBulkWithRetry(startRow, rowBuffer);
         rowBuffer = [];
@@ -99,26 +105,23 @@ async function loadCookies(page) {
 
       await new Promise((r) => setTimeout(r, 1000));
     } catch (err) {
-      console.error(` Error scraping ${url}:`, err.message);
+      console.error(`Error scraping ${url}:`, err.message);
     }
 
     if ((i + 1) % 100 === 0) {
       console.log("Restarting page to clear memory...");
       await page.close();
       page = await browser.newPage();
+
+      // ✅ Re-apply cookies correctly after new page
       await loadCookies(page);
     }
 
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  // Write any remaining rows.
   if (rowBuffer.length > 0) {
-    console.log(
-      `🧹 Writing remaining ${rowBuffer.length} rows starting from ${
-        startRow + 2
-      }`
-    );
+    console.log(`🧹 Writing remaining ${rowBuffer.length} rows starting from ${startRow + 2}`);
     await writeBulkWithRetry(startRow, rowBuffer);
   }
 
