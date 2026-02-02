@@ -103,7 +103,7 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
 
-    company_list = sheet_main.col_values(5)
+    company_list = sheet_main.col_values(3)
     name_list = sheet_main.col_values(1)
 
     current_date = date.today().strftime("%m/%d/%Y")
