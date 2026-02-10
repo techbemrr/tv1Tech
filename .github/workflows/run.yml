@@ -1,9 +1,7 @@
 name: TradingView Scraper A1
 
 on:
-  schedule:
-    - cron: "30 11 * * 1-5"
-  workflow_dispatch:
+  workflow_dispatch:   # ✅ manual only
 
 jobs:
   scrape:
@@ -11,6 +9,7 @@ jobs:
       matrix:
         batch: [0, 1, 2, 3, 4]
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
