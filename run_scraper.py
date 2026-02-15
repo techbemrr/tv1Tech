@@ -22,10 +22,11 @@ SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
+FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 
 # ✅ Proper checkpoint format:
-# DONE:<index>  (last fully completed index)
-# INPROG:<index> (currently working index)
+# DONE:<index>   => last fully completed index
+# INPROG:<index> => currently working index (not completed)
 def read_checkpoint():
     if not os.path.exists(checkpoint_file):
         return 0
@@ -34,9 +35,8 @@ def read_checkpoint():
         if raw.startswith("DONE:"):
             return int(raw.split("DONE:")[1].strip()) + 1
         if raw.startswith("INPROG:"):
-            # resume from same index because it wasn't completed
             return int(raw.split("INPROG:")[1].strip())
-        return int(raw)  # fallback old format
+        return int(raw)  # legacy fallback
     except:
         return 0
 
@@ -56,10 +56,7 @@ def write_checkpoint_done(i):
 
 last_i = read_checkpoint()
 
-# ✅ Failed rows
-FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 _failed_seen = set()
-
 def mark_failed(i, reason="NO_VALUES"):
     if i in _failed_seen:
         return
@@ -71,13 +68,18 @@ def mark_failed(i, reason="NO_VALUES"):
         pass
 
 # ---------------- BROWSER FACTORY ---------------- #
+def _pick_first_existing(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
 
     opts = Options()
     opts.page_load_strategy = "eager"
 
-    # GitHub runner chromium flags
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -94,20 +96,46 @@ def create_driver():
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
 
+    # ✅ critical for GH Actions headless stability
+    opts.add_argument("--remote-debugging-port=9222")
+
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # ✅ Use system chromedriver path on ubuntu runner (FAST, no download/hang)
-    chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
-    service = Service(chromedriver_path)
+    # ✅ Pick correct Chromium/Chrome binary
+    chrome_bin = _pick_first_existing([
+        os.getenv("CHROME_BINARY"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+    ])
+    if not chrome_bin:
+        log("❌ No chromium/chrome binary found.")
+        raise RuntimeError("Chrome binary not found")
+    opts.binary_location = chrome_bin
+    log(f"✅ Using Chrome binary: {chrome_bin}")
+
+    # ✅ Pick correct ChromeDriver binary
+    driver_bin = _pick_first_existing([
+        os.getenv("CHROMEDRIVER_PATH"),
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+    ])
+    if driver_bin:
+        log(f"✅ Using ChromeDriver: {driver_bin}")
+        service = Service(driver_bin)
+    else:
+        log("⚠️ ChromeDriver not found in common paths; trying PATH...")
+        service = Service()
 
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(45)
 
-    # ---- COOKIE LOGIC (force correct domain + safe fields) ----
+    # ---- COOKIE LOGIC (force domain + safe fields) ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
@@ -146,6 +174,7 @@ def create_driver():
     return driver
 
 # ---------------- SCRAPER LOGIC ---------------- #
+# ✅ DO NOT CHANGE: your exact XPATH + your exact class parsing kept as-is
 def scrape_tradingview(driver, url):
     try:
         driver.get(url)
@@ -215,7 +244,6 @@ try:
 
     total_rows = max(len(company_list_c), len(company_list_d), len(name_list))
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
-
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
@@ -254,7 +282,7 @@ try:
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        # ✅ mark IN_PROGRESS BEFORE starting row
+        # ✅ mark in-progress before starting
         write_checkpoint_inprog(i)
 
         url_c = (company_list_c[i] or "").strip() if i < len(company_list_c) else ""
@@ -264,12 +292,12 @@ try:
         if not (url_c.startswith("http") or url_d.startswith("http")):
             log(f"⏭️ Row {i+1}: invalid/blank URL in both C/D -> skipped")
             mark_failed(i, "BAD_URL_BOTH")
-            write_checkpoint_done(i)  # ✅ completed (skipped but done)
+            write_checkpoint_done(i)
             continue
 
         log(f"🔍 [{i+1}/{total_rows}] Scraping: {name}")
 
-        # --- C link ---
+        # ---- scrape C ----
         values_c = []
         if url_c.startswith("http"):
             values_c = scrape_with_retries(driver, url_c, tries=7)
@@ -283,7 +311,7 @@ try:
         else:
             mark_failed(i, "BAD_URL_C")
 
-        # --- D link ---
+        # ---- scrape D ----
         values_d = []
         if url_d.startswith("http"):
             values_d = scrape_with_retries(driver, url_d, tries=7)
@@ -323,7 +351,7 @@ try:
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
 
-        # ✅ mark DONE only AFTER row is processed and buffered
+        # ✅ mark done only after the row work is done
         write_checkpoint_done(i)
 
         if ROW_SLEEP:
