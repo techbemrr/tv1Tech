@@ -25,7 +25,7 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
 
-# ✅ NEW: save failed rows (does NOT change main scraping XPATH or class)
+# ✅ save failed rows
 FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 _failed_seen = set()
 
@@ -39,14 +39,13 @@ def mark_failed(i, reason="NO_VALUES"):
     except:
         pass
 
-# ✅ Speed: resolve chromedriver path ONCE (restart will reuse it)
+# ✅ Speed: resolve chromedriver path ONCE
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
     opts = Options()
-
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -71,25 +70,39 @@ def create_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    driver = webdriver.Chrome(
-        service=Service(CHROME_DRIVER_PATH),
-        options=opts
-    )
+    driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     driver.set_page_load_timeout(45)
 
-    # ---- COOKIE LOGIC (FIX: include domain so cookies actually apply) ----
+    # ---- COOKIE LOGIC (FIXED: force correct domain + safe fields) ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
             time.sleep(2)
+
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
 
-            allow = ("name", "value", "domain", "path", "secure", "expiry", "httpOnly", "sameSite")
             ok = 0
             for c in cookies:
                 try:
-                    driver.add_cookie({k: v for k, v in c.items() if k in allow})
+                    cc = {
+                        "name": c.get("name"),
+                        "value": c.get("value"),
+                        "path": c.get("path", "/"),
+                        "secure": bool(c.get("secure", False)),
+                        "httpOnly": bool(c.get("httpOnly", False)),
+                        # ✅ force correct domain for GitHub runner
+                        "domain": "in.tradingview.com",
+                    }
+
+                    # expiry must be int if present
+                    if "expiry" in c:
+                        try:
+                            cc["expiry"] = int(c["expiry"])
+                        except:
+                            pass
+
+                    driver.add_cookie(cc)
                     ok += 1
                 except:
                     continue
@@ -114,7 +127,6 @@ def scrape_tradingview(driver, url):
             ))
         )
 
-        # ✅ Extra safety: detect common blocked pages (doesn't change selector)
         html = driver.page_source.lower()
         if "captcha" in html or "access denied" in html or "sign in" in html:
             return "RESTART"
@@ -131,7 +143,6 @@ def scrape_tradingview(driver, url):
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
-# ✅ NEW: retries wrapper (does not change main scraping path/location)
 def scrape_with_retries(driver, url, tries=7):
     delay = 1.0
     for _ in range(tries):
@@ -143,14 +154,19 @@ def scrape_with_retries(driver, url, tries=7):
         if isinstance(values, list) and values:
             return values
 
-        # backoff + jitter
         try:
             driver.refresh()
         except:
             pass
+
         time.sleep(delay + random.uniform(0.1, 0.7))
         delay = min(delay * 1.7, 12)
 
+    return []
+
+def last3(values):
+    if isinstance(values, list) and len(values) >= 3:
+        return values[-3:]
     return []
 
 # ---------------- INITIAL SETUP ---------------- #
@@ -158,12 +174,17 @@ log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
-    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
 
-    company_list = sheet_main.col_values(3)  # URLs
-    name_list = sheet_main.col_values(1)     # Names
+    # ✅ store to Sheet16
+    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
 
-    log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {len(company_list)}")
+    # ✅ read BOTH column C and D
+    company_list_c = sheet_main.col_values(3)  # C
+    company_list_d = sheet_main.col_values(4)  # D
+    name_list = sheet_main.col_values(1)       # A
+
+    total_rows = max(len(company_list_c), len(company_list_d), len(name_list))
+    log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
@@ -197,48 +218,75 @@ def flush_batch():
                 time.sleep(3 + attempt)
 
 try:
-    for i in range(last_i, len(company_list)):
+    for i in range(last_i, total_rows):
 
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        url = (company_list[i] or "").strip()
-        name = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
+        url_c = (company_list_c[i] or "").strip() if i < len(company_list_c) else ""
+        url_d = (company_list_d[i] or "").strip() if i < len(company_list_d) else ""
+        name  = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
 
-        if not url.startswith("http"):
-            log(f"⏭️ Row {i+1}: invalid/blank URL -> skipped")
-            mark_failed(i, "BAD_URL")
+        if not (url_c.startswith("http") or url_d.startswith("http")):
+            log(f"⏭️ Row {i+1}: invalid/blank URL in both C/D -> skipped")
+            mark_failed(i, "BAD_URL_BOTH")
             with open(checkpoint_file, "w") as f:
                 f.write(str(i + 1))
             continue
 
-        log(f"🔍 [{i+1}/{len(company_list)}] Scraping: {name}")
+        log(f"🔍 [{i+1}/{total_rows}] Scraping: {name}")
 
-        # ✅ only reliability improved; XPATH/class not changed
-        values = scrape_with_retries(driver, url, tries=7)
+        # --- C link ---
+        values_c = []
+        if url_c.startswith("http"):
+            values_c = scrape_with_retries(driver, url_c, tries=7)
+            if values_c == "RESTART":
+                try: driver.quit()
+                except: pass
+                driver = create_driver()
+                values_c = scrape_with_retries(driver, url_c, tries=5)
+                if values_c == "RESTART":
+                    values_c = []
+        else:
+            mark_failed(i, "BAD_URL_C")
 
-        if values == "RESTART":
-            try:
-                driver.quit()
-            except:
-                pass
-            driver = create_driver()
-            values = scrape_with_retries(driver, url, tries=5)
-            if values == "RESTART":
-                values = []
+        # --- D link ---
+        values_d = []
+        if url_d.startswith("http"):
+            values_d = scrape_with_retries(driver, url_d, tries=7)
+            if values_d == "RESTART":
+                try: driver.quit()
+                except: pass
+                driver = create_driver()
+                values_d = scrape_with_retries(driver, url_d, tries=5)
+                if values_d == "RESTART":
+                    values_d = []
+        else:
+            mark_failed(i, "BAD_URL_D")
+
+        # last 3 only
+        last3_c = last3(values_c)
+        last3_d = last3(values_d)
 
         target_row = i + 1
 
-        if isinstance(values, list) and values:
-            batch_list.append({"range": f"A{target_row}", "values": [[name]]})
-            batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
-            batch_list.append({"range": f"K{target_row}", "values": [values]})
-            log(f"✅ Values: {len(values)} cells | Buffered: {len(batch_list)}/{BATCH_SIZE}")
+        # always write name + date
+        batch_list.append({"range": f"A{target_row}", "values": [[name]]})
+        batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
+
+        # C -> K:M
+        if last3_c:
+            batch_list.append({"range": f"K{target_row}:M{target_row}", "values": [last3_c]})
         else:
-            batch_list.append({"range": f"A{target_row}", "values": [[name]]})
-            batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
-            mark_failed(i, "NO_VALUES")
-            log(f"⚠️ No values found for {name} (A/J updated only)")
+            mark_failed(i, "NO_LAST3_C")
+
+        # D -> N:P
+        if last3_d:
+            batch_list.append({"range": f"N{target_row}:P{target_row}", "values": [last3_d]})
+        else:
+            mark_failed(i, "NO_LAST3_D")
+
+        log(f"✅ C_last3={len(last3_c)} | D_last3={len(last3_d)} | Buffered: {len(batch_list)}/{BATCH_SIZE}")
 
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
