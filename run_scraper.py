@@ -68,16 +68,22 @@ def mark_failed(i, reason="NO_VALUES"):
         pass
 
 # ---------------- BROWSER FACTORY ---------------- #
-def _pick_first_existing(paths):
-    for p in paths:
-        if p and os.path.exists(p):
-            return p
-    return None
-
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
 
+    chrome_bin = os.getenv("CHROME_BINARY", "/usr/bin/chromium")
+    driver_bin = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
+    if not os.path.exists(chrome_bin):
+        raise RuntimeError(f"Chrome binary not found: {chrome_bin}")
+    if not os.path.exists(driver_bin):
+        raise RuntimeError(f"ChromeDriver not found: {driver_bin}")
+
+    log(f"✅ Using Chrome: {chrome_bin}")
+    log(f"✅ Using ChromeDriver: {driver_bin}")
+
     opts = Options()
+    opts.binary_location = chrome_bin
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -96,7 +102,7 @@ def create_driver():
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
 
-    # ✅ critical for GH Actions headless stability
+    # ✅ helps prevent hangs in headless on GH Actions
     opts.add_argument("--remote-debugging-port=9222")
 
     opts.add_argument(
@@ -105,37 +111,11 @@ def create_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # ✅ Pick correct Chromium/Chrome binary
-    chrome_bin = _pick_first_existing([
-        os.getenv("CHROME_BINARY"),
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-    ])
-    if not chrome_bin:
-        log("❌ No chromium/chrome binary found.")
-        raise RuntimeError("Chrome binary not found")
-    opts.binary_location = chrome_bin
-    log(f"✅ Using Chrome binary: {chrome_bin}")
-
-    # ✅ Pick correct ChromeDriver binary
-    driver_bin = _pick_first_existing([
-        os.getenv("CHROMEDRIVER_PATH"),
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-    ])
-    if driver_bin:
-        log(f"✅ Using ChromeDriver: {driver_bin}")
-        service = Service(driver_bin)
-    else:
-        log("⚠️ ChromeDriver not found in common paths; trying PATH...")
-        service = Service()
-
+    service = Service(driver_bin)
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(45)
 
-    # ---- COOKIE LOGIC (force domain + safe fields) ----
+    # ---- COOKIE LOGIC (safe + domain forced) ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
@@ -282,7 +262,6 @@ try:
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        # ✅ mark in-progress before starting
         write_checkpoint_inprog(i)
 
         url_c = (company_list_c[i] or "").strip() if i < len(company_list_c) else ""
@@ -351,7 +330,6 @@ try:
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
 
-        # ✅ mark done only after the row work is done
         write_checkpoint_done(i)
 
         if ROW_SLEEP:
