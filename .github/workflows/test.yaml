@@ -1,0 +1,66 @@
+name: TradingView MV2 Sheet16 Scraper
+
+on:
+  workflow_dispatch:   # manual run only
+
+jobs:
+  scrape:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]   # adjust shards if needed
+
+    env:
+      SHARD_INDEX: ${{ matrix.shard }}
+      SHARD_STEP: 5
+      CHECKPOINT_FILE: checkpoint_${{ matrix.shard }}.txt
+      FAILED_FILE: failed_${{ matrix.shard }}.txt
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver
+          chromium-browser --version
+          chromedriver --version
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install selenium beautifulsoup4 gspread webdriver-manager
+
+      - name: Restore checkpoint (if missing)
+        run: |
+          FILE="checkpoint_${{ matrix.shard }}.txt"
+          [ ! -f "$FILE" ] && echo "0" > "$FILE"
+
+      - name: Create credentials.json
+        run: |
+          echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
+
+      - name: Create cookies.json (TradingView)
+        run: |
+          echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
+
+      - name: Run scraper
+        run: |
+          python test.py
+
+      - name: Upload logs (checkpoint + failed)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}-logs
+          path: |
+            checkpoint_${{ matrix.shard }}.txt
+            failed_${{ matrix.shard }}.txt
