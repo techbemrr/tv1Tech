@@ -13,6 +13,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from bs4 import BeautifulSoup
 import gspread
+from webdriver_manager.chrome import ChromeDriverManager
 
 def log(msg):
     print(msg, flush=True)
@@ -22,50 +23,12 @@ SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
+last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
+
+# ✅ NEW: save failed rows (does NOT change main scraping XPATH or class)
 FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
-
-# ✅ ensure files exist ALWAYS (so artifact upload works)
-try:
-    open(checkpoint_file, "a").close()
-    open(FAILED_FILE, "a").close()
-except:
-    pass
-
-# ✅ Proper checkpoint format:
-# DONE:<index>   => last fully completed index
-# INPROG:<index> => currently working index (not completed)
-def read_checkpoint():
-    if not os.path.exists(checkpoint_file):
-        return 0
-    try:
-        raw = open(checkpoint_file, "r").read().strip()
-        if raw.startswith("DONE:"):
-            return int(raw.split("DONE:")[1].strip()) + 1
-        if raw.startswith("INPROG:"):
-            return int(raw.split("INPROG:")[1].strip())
-        if raw == "":
-            return 0
-        return int(raw)  # legacy fallback
-    except:
-        return 0
-
-def write_checkpoint_inprog(i):
-    try:
-        with open(checkpoint_file, "w") as f:
-            f.write(f"INPROG:{i}")
-    except:
-        pass
-
-def write_checkpoint_done(i):
-    try:
-        with open(checkpoint_file, "w") as f:
-            f.write(f"DONE:{i}")
-    except:
-        pass
-
-last_i = read_checkpoint()
-
 _failed_seen = set()
+
 def mark_failed(i, reason="NO_VALUES"):
     if i in _failed_seen:
         return
@@ -76,24 +39,14 @@ def mark_failed(i, reason="NO_VALUES"):
     except:
         pass
 
+# ✅ Speed: resolve chromedriver path ONCE (restart will reuse it)
+CHROME_DRIVER_PATH = ChromeDriverManager().install()
+
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
-
-    chrome_bin = os.getenv("CHROME_BINARY", "/usr/bin/chromium")
-    driver_bin = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
-
-    # show paths in logs to debug instantly
-    log(f"🔧 CHROME_BINARY={chrome_bin}")
-    log(f"🔧 CHROMEDRIVER_PATH={driver_bin}")
-
-    if not os.path.exists(chrome_bin):
-        raise RuntimeError(f"Chrome binary not found: {chrome_bin}")
-    if not os.path.exists(driver_bin):
-        raise RuntimeError(f"ChromeDriver not found: {driver_bin}")
-
     opts = Options()
-    opts.binary_location = chrome_bin
+
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -112,45 +65,31 @@ def create_driver():
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
 
-    # ✅ helps prevent hang on GH Actions
-    opts.add_argument("--remote-debugging-port=9222")
-
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    service = Service(driver_bin)
-    driver = webdriver.Chrome(service=service, options=opts)
+    driver = webdriver.Chrome(
+        service=Service(CHROME_DRIVER_PATH),
+        options=opts
+    )
     driver.set_page_load_timeout(45)
 
-    # ---- COOKIE LOGIC (safe + domain forced) ----
+    # ---- COOKIE LOGIC (FIX: include domain so cookies actually apply) ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
             time.sleep(2)
-
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
 
+            allow = ("name", "value", "domain", "path", "secure", "expiry", "httpOnly", "sameSite")
             ok = 0
             for c in cookies:
                 try:
-                    cc = {
-                        "name": c.get("name"),
-                        "value": c.get("value"),
-                        "path": c.get("path", "/"),
-                        "secure": bool(c.get("secure", False)),
-                        "httpOnly": bool(c.get("httpOnly", False)),
-                        "domain": "in.tradingview.com",
-                    }
-                    if "expiry" in c:
-                        try:
-                            cc["expiry"] = int(c["expiry"])
-                        except:
-                            pass
-                    driver.add_cookie(cc)
+                    driver.add_cookie({k: v for k, v in c.items() if k in allow})
                     ok += 1
                 except:
                     continue
@@ -159,9 +98,7 @@ def create_driver():
             time.sleep(1)
             log(f"✅ Cookies applied successfully ({ok}/{len(cookies)})")
         except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:160]}")
-    else:
-        log("⚠️ cookies.json not found (running without cookies)")
+            log(f"⚠️ Cookie error: {str(e)[:120]}")
 
     return driver
 
@@ -177,6 +114,7 @@ def scrape_tradingview(driver, url):
             ))
         )
 
+        # ✅ Extra safety: detect common blocked pages (doesn't change selector)
         html = driver.page_source.lower()
         if "captcha" in html or "access denied" in html or "sign in" in html:
             return "RESTART"
@@ -193,6 +131,7 @@ def scrape_tradingview(driver, url):
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
+# ✅ NEW: retries wrapper (does not change main scraping path/location)
 def scrape_with_retries(driver, url, tries=7):
     delay = 1.0
     for _ in range(tries):
@@ -204,19 +143,14 @@ def scrape_with_retries(driver, url, tries=7):
         if isinstance(values, list) and values:
             return values
 
+        # backoff + jitter
         try:
             driver.refresh()
         except:
             pass
-
         time.sleep(delay + random.uniform(0.1, 0.7))
         delay = min(delay * 1.7, 12)
 
-    return []
-
-def last3(values):
-    if isinstance(values, list) and len(values) >= 3:
-        return values[-3:]
     return []
 
 # ---------------- INITIAL SETUP ---------------- #
@@ -224,23 +158,18 @@ log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
+    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
 
-    # ✅ store to Sheet16
-    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
+    company_list = sheet_main.col_values(3)  # URLs
+    name_list = sheet_main.col_values(1)     # Names
 
-    # ✅ read BOTH column C and D
-    company_list_c = sheet_main.col_values(3)  # C
-    company_list_d = sheet_main.col_values(4)  # D
-    name_list = sheet_main.col_values(1)       # A
-
-    total_rows = max(len(company_list_c), len(company_list_d), len(name_list))
-    log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
+    log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {len(company_list)}")
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
-driver = None
+driver = create_driver()
 batch_list = []
 
 BATCH_SIZE = 300
@@ -268,82 +197,54 @@ def flush_batch():
                 time.sleep(3 + attempt)
 
 try:
-    driver = create_driver()
-
-    for i in range(last_i, total_rows):
+    for i in range(last_i, len(company_list)):
 
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        write_checkpoint_inprog(i)
+        url = (company_list[i] or "").strip()
+        name = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
 
-        url_c = (company_list_c[i] or "").strip() if i < len(company_list_c) else ""
-        url_d = (company_list_d[i] or "").strip() if i < len(company_list_d) else ""
-        name  = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
-
-        if not (url_c.startswith("http") or url_d.startswith("http")):
-            log(f"⏭️ Row {i+1}: invalid/blank URL in both C/D -> skipped")
-            mark_failed(i, "BAD_URL_BOTH")
-            write_checkpoint_done(i)
+        if not url.startswith("http"):
+            log(f"⏭️ Row {i+1}: invalid/blank URL -> skipped")
+            mark_failed(i, "BAD_URL")
+            with open(checkpoint_file, "w") as f:
+                f.write(str(i + 1))
             continue
 
-        log(f"🔍 [{i+1}/{total_rows}] Scraping: {name}")
+        log(f"🔍 [{i+1}/{len(company_list)}] Scraping: {name}")
 
-        # ---- scrape C ----
-        values_c = []
-        if url_c.startswith("http"):
-            values_c = scrape_with_retries(driver, url_c, tries=7)
-            if values_c == "RESTART":
-                try: driver.quit()
-                except: pass
-                driver = create_driver()
-                values_c = scrape_with_retries(driver, url_c, tries=5)
-                if values_c == "RESTART":
-                    values_c = []
-        else:
-            mark_failed(i, "BAD_URL_C")
+        # ✅ only reliability improved; XPATH/class not changed
+        values = scrape_with_retries(driver, url, tries=7)
 
-        # ---- scrape D ----
-        values_d = []
-        if url_d.startswith("http"):
-            values_d = scrape_with_retries(driver, url_d, tries=7)
-            if values_d == "RESTART":
-                try: driver.quit()
-                except: pass
-                driver = create_driver()
-                values_d = scrape_with_retries(driver, url_d, tries=5)
-                if values_d == "RESTART":
-                    values_d = []
-        else:
-            mark_failed(i, "BAD_URL_D")
-
-        last3_c = last3(values_c)
-        last3_d = last3(values_d)
+        if values == "RESTART":
+            try:
+                driver.quit()
+            except:
+                pass
+            driver = create_driver()
+            values = scrape_with_retries(driver, url, tries=5)
+            if values == "RESTART":
+                values = []
 
         target_row = i + 1
 
-        # always write name + date
-        batch_list.append({"range": f"A{target_row}", "values": [[name]]})
-        batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
-
-        # C -> K:M
-        if last3_c:
-            batch_list.append({"range": f"K{target_row}:M{target_row}", "values": [last3_c]})
+        if isinstance(values, list) and values:
+            batch_list.append({"range": f"A{target_row}", "values": [[name]]})
+            batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
+            batch_list.append({"range": f"K{target_row}", "values": [values]})
+            log(f"✅ Values: {len(values)} cells | Buffered: {len(batch_list)}/{BATCH_SIZE}")
         else:
-            mark_failed(i, "NO_LAST3_C")
-
-        # D -> N:P
-        if last3_d:
-            batch_list.append({"range": f"N{target_row}:P{target_row}", "values": [last3_d]})
-        else:
-            mark_failed(i, "NO_LAST3_D")
-
-        log(f"✅ C_last3={len(last3_c)} | D_last3={len(last3_d)} | Buffered: {len(batch_list)}/{BATCH_SIZE}")
+            batch_list.append({"range": f"A{target_row}", "values": [[name]]})
+            batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
+            mark_failed(i, "NO_VALUES")
+            log(f"⚠️ No values found for {name} (A/J updated only)")
 
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
 
-        write_checkpoint_done(i)
+        with open(checkpoint_file, "w") as f:
+            f.write(str(i + 1))
 
         if ROW_SLEEP:
             time.sleep(ROW_SLEEP)
@@ -351,10 +252,8 @@ try:
 finally:
     flush_batch()
     try:
-        if driver:
-            driver.quit()
+        driver.quit()
     except:
         pass
     log("🏁 Scraping completed successfully")
     log(f"📌 Failed rows file: {FAILED_FILE}")
-    log(f"📌 Checkpoint file: {checkpoint_file}")
