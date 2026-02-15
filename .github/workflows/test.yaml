@@ -1,7 +1,11 @@
-name: TradingView MV2 Sheet16 Scraper
+name: T4 (Shards 15–19)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # Manual run
+  schedule:
+    # 5:33 PM IST = 12:03 UTC
+    # Runs ONLY Monday–Friday
+    - cron: '10 12 * * 1-5'
 
 jobs:
   scrape:
@@ -9,62 +13,35 @@ jobs:
 
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        shard: [0, 1, 2, 3, 4]
+        shard: [15,16,17,18,19]
 
     env:
-      SHARD_INDEX: ${{ matrix.shard }}
-      SHARD_STEP: 5
-      CHECKPOINT_FILE: checkpoint_${{ matrix.shard }}.txt
-      FAILED_FILE: failed_${{ matrix.shard }}.txt
-
-      # ✅ Use preinstalled Google Chrome on GitHub runner
-      CHROME_BINARY: /usr/bin/google-chrome
+      SHARD_STEP: 20
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
-      - name: Verify Chrome exists
-        run: |
-          which google-chrome || true
-          google-chrome --version || true
-          ls -l /usr/bin/google-chrome || true
+      - name: Install dependencies
+        run: pip install selenium beautifulsoup4 gspread webdriver-manager
 
-      - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          # selenium manager works best with selenium>=4.6 (latest is fine)
-          pip install selenium beautifulsoup4 gspread
-
-      - name: Ensure checkpoint/failed files exist
-        run: |
-          touch checkpoint_${{ matrix.shard }}.txt
-          touch failed_${{ matrix.shard }}.txt
-          ls -l checkpoint_${{ matrix.shard }}.txt failed_${{ matrix.shard }}.txt
-
-      - name: Create credentials.json
+      - name: Write credentials
         run: |
           echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
-
-      - name: Create cookies.json
-        run: |
           echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
 
-      - name: Run scraper
+      - name: Init checkpoint
         run: |
-          python test.py
+          FILE="checkpoint_group4_${{ matrix.shard }}.txt"
+          [ ! -f "$FILE" ] && echo "1" > "$FILE"
 
-      - name: Upload shard logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: shard-${{ matrix.shard }}-logs
-          path: |
-            checkpoint_${{ matrix.shard }}.txt
-            failed_${{ matrix.shard }}.txt
+      - name: Run scraper
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          CHECKPOINT_FILE: checkpoint_group4_${{ matrix.shard }}.txt
+        run: python test.py
