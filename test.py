@@ -112,6 +112,18 @@ def scrape_tradingview(driver, url):
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
+def scrape_with_retry(driver, url):
+    """Retry once if empty. Returns list, [] or 'RESTART'."""
+    values = scrape_tradingview(driver, url)
+    if values == []:
+        try:
+            driver.refresh()
+            time.sleep(0.7)
+        except:
+            pass
+        values = scrape_tradingview(driver, url)
+    return values
+
 # ---------------- INITIAL SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
@@ -119,10 +131,12 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
 
-    company_list = sheet_main.col_values(3)  # URLs
-    name_list = sheet_main.col_values(1)     # Names
+    name_list = sheet_main.col_values(1)      # Names
+    url_list_c = sheet_main.col_values(3)     # ✅ Column C links
+    url_list_d = sheet_main.col_values(4)     # ✅ Column D links
 
-    log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {len(company_list)}")
+    total_rows = max(len(name_list), len(url_list_c), len(url_list_d))
+    log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
@@ -131,13 +145,8 @@ except Exception as e:
 driver = create_driver()
 batch_list = []
 
-# ✅ Faster: bigger batch = fewer API calls
 BATCH_SIZE = 300
-
-# ✅ Faster: compute date once (same run)
 current_date = date.today().strftime("%m/%d/%Y")
-
-# ✅ Faster: reduce sleep (or make 0)
 ROW_SLEEP = 0.05
 
 def flush_batch():
@@ -159,60 +168,77 @@ def flush_batch():
             else:
                 time.sleep(3)
 
-try:
-    # ✅ Run till END (removed fixed 2500 break)
-    for i in range(last_i, len(company_list)):
+def safe_get(lst, idx):
+    return (lst[idx] if idx < len(lst) else "").strip()
 
-        # ✅ Keep your sharding (only skips rows that belong to OTHER shards)
+try:
+    for i in range(last_i, total_rows):
+
+        # ✅ Keep sharding
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        url = (company_list[i] or "").strip()
-        name = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
-
-        # ✅ Skip only truly invalid URL rows (otherwise it wastes 45s timeout)
-        if not url.startswith("http"):
-            log(f"⏭️ Row {i+1}: invalid/blank URL -> skipped")
-            with open(checkpoint_file, "w") as f:
-                f.write(str(i + 1))
-            continue
-
-        log(f"🔍 [{i+1}/{len(company_list)}] Scraping: {name}")
-
-        # ✅ Reliability: retry ONCE if empty (extractor unchanged)
-        values = scrape_tradingview(driver, url)
-        if values == []:
-            try:
-                driver.refresh()
-                time.sleep(0.7)
-            except:
-                pass
-            values = scrape_tradingview(driver, url)
-
-        # Restart browser if crashed
-        if values == "RESTART":
-            try:
-                driver.quit()
-            except:
-                pass
-            driver = create_driver()
-            values = scrape_tradingview(driver, url)
-            if values == "RESTART":
-                values = []
+        name = safe_get(name_list, i) or f"Row {i+1}"
+        url_c = safe_get(url_list_c, i)   # Column C
+        url_d = safe_get(url_list_d, i)   # Column D
 
         target_row = i + 1
+        log(f"🔍 [{target_row}/{total_rows}] Scraping: {name}")
 
-        if isinstance(values, list) and values:
-            # ✅ Only write A, J, and K onward. DO NOT touch B..I.
-            batch_list.append({"range": f"A{target_row}", "values": [[name]]})
-            batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
-            batch_list.append({"range": f"K{target_row}", "values": [values]})
-            log(f"✅ Values: {len(values)} cells | Buffered: {len(batch_list)}/{BATCH_SIZE}")
+        combined_values = []
+
+        # ---------- SCRAPE COLUMN C LINK ----------
+        values_c = []
+        if url_c.startswith("http"):
+            log(f"   🌐 C link visiting...")
+            values_c = scrape_with_retry(driver, url_c)
+
+            if values_c == "RESTART":
+                try:
+                    driver.quit()
+                except:
+                    pass
+                driver = create_driver()
+                values_c = scrape_with_retry(driver, url_c)
+                if values_c == "RESTART":
+                    values_c = []
         else:
-            # Keep your behavior: still write name/date even if values missing
-            batch_list.append({"range": f"A{target_row}", "values": [[name]]})
-            batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
-            log(f"⚠️ No values found for {name} (A/J updated only)")
+            log(f"   ⏭️ C link invalid/blank")
+
+        # ---------- SCRAPE COLUMN D LINK ----------
+        values_d = []
+        if url_d.startswith("http"):
+            log(f"   🌐 D link visiting...")
+            values_d = scrape_with_retry(driver, url_d)
+
+            if values_d == "RESTART":
+                try:
+                    driver.quit()
+                except:
+                    pass
+                driver = create_driver()
+                values_d = scrape_with_retry(driver, url_d)
+                if values_d == "RESTART":
+                    values_d = []
+        else:
+            log(f"   ⏭️ D link invalid/blank")
+
+        # ✅ COMBINE: C values + D values (single merged array)
+        if isinstance(values_c, list) and values_c:
+            combined_values.extend(values_c)
+        if isinstance(values_d, list) and values_d:
+            combined_values.extend(values_d)
+
+        # ---------- WRITE OUTPUT ----------
+        # ✅ Always write name/date. Values only if combined has data.
+        batch_list.append({"range": f"A{target_row}", "values": [[name]]})
+        batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
+
+        if combined_values:
+            batch_list.append({"range": f"K{target_row}", "values": [combined_values]})
+            log(f"✅ Combined values: {len(combined_values)} cells (C:{len(values_c)} + D:{len(values_d)})")
+        else:
+            log(f"⚠️ No values found from both links (C:{len(values_c)} + D:{len(values_d)})")
 
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
