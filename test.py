@@ -5,7 +5,6 @@ import json
 import random
 from datetime import date
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -80,22 +79,19 @@ def mark_failed(i, reason="NO_VALUES"):
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
 
-    chrome_bin = os.getenv("CHROME_BINARY", "/usr/bin/chromium")
-    driver_bin = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
-
-    # show paths in logs to debug instantly
-    log(f"🔧 CHROME_BINARY={chrome_bin}")
-    log(f"🔧 CHROMEDRIVER_PATH={driver_bin}")
-
-    if not os.path.exists(chrome_bin):
-        raise RuntimeError(f"Chrome binary not found: {chrome_bin}")
-    if not os.path.exists(driver_bin):
-        raise RuntimeError(f"ChromeDriver not found: {driver_bin}")
+    # ✅ Use Google Chrome that already exists on GitHub runners
+    # You can override via env if needed.
+    chrome_bin = os.getenv("CHROME_BINARY", "/usr/bin/google-chrome")
 
     opts = Options()
-    opts.binary_location = chrome_bin
-    opts.page_load_strategy = "eager"
+    if os.path.exists(chrome_bin):
+        opts.binary_location = chrome_bin
+        log(f"✅ Using Chrome binary: {chrome_bin}")
+    else:
+        # fallback: try without binary_location (selenium manager may find it)
+        log(f"⚠️ Chrome binary not found at {chrome_bin}, trying system default...")
 
+    opts.page_load_strategy = "eager"
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -112,7 +108,7 @@ def create_driver():
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
 
-    # ✅ helps prevent hang on GH Actions
+    # ✅ helps prevent hang in GH headless
     opts.add_argument("--remote-debugging-port=9222")
 
     opts.add_argument(
@@ -121,8 +117,9 @@ def create_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    service = Service(driver_bin)
-    driver = webdriver.Chrome(service=service, options=opts)
+    # ✅ IMPORTANT: no chromedriver path here.
+    # Selenium Manager will auto-download matching driver.
+    driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(45)
 
     # ---- COOKIE LOGIC (safe + domain forced) ----
