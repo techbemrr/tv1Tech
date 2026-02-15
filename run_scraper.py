@@ -24,6 +24,13 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 
+# ✅ ensure files exist ALWAYS (so artifact upload works)
+try:
+    open(checkpoint_file, "a").close()
+    open(FAILED_FILE, "a").close()
+except:
+    pass
+
 # ✅ Proper checkpoint format:
 # DONE:<index>   => last fully completed index
 # INPROG:<index> => currently working index (not completed)
@@ -36,6 +43,8 @@ def read_checkpoint():
             return int(raw.split("DONE:")[1].strip()) + 1
         if raw.startswith("INPROG:"):
             return int(raw.split("INPROG:")[1].strip())
+        if raw == "":
+            return 0
         return int(raw)  # legacy fallback
     except:
         return 0
@@ -74,13 +83,14 @@ def create_driver():
     chrome_bin = os.getenv("CHROME_BINARY", "/usr/bin/chromium")
     driver_bin = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
+    # show paths in logs to debug instantly
+    log(f"🔧 CHROME_BINARY={chrome_bin}")
+    log(f"🔧 CHROMEDRIVER_PATH={driver_bin}")
+
     if not os.path.exists(chrome_bin):
         raise RuntimeError(f"Chrome binary not found: {chrome_bin}")
     if not os.path.exists(driver_bin):
         raise RuntimeError(f"ChromeDriver not found: {driver_bin}")
-
-    log(f"✅ Using Chrome: {chrome_bin}")
-    log(f"✅ Using ChromeDriver: {driver_bin}")
 
     opts = Options()
     opts.binary_location = chrome_bin
@@ -102,7 +112,7 @@ def create_driver():
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
 
-    # ✅ helps prevent hangs in headless on GH Actions
+    # ✅ helps prevent hang on GH Actions
     opts.add_argument("--remote-debugging-port=9222")
 
     opts.add_argument(
@@ -150,6 +160,8 @@ def create_driver():
             log(f"✅ Cookies applied successfully ({ok}/{len(cookies)})")
         except Exception as e:
             log(f"⚠️ Cookie error: {str(e)[:160]}")
+    else:
+        log("⚠️ cookies.json not found (running without cookies)")
 
     return driver
 
@@ -175,7 +187,6 @@ def scrape_tradingview(driver, url):
             for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
         ]
         return values
-
     except (TimeoutException, NoSuchElementException):
         return []
     except WebDriverException:
@@ -229,7 +240,7 @@ except Exception as e:
     sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
-driver = create_driver()
+driver = None
 batch_list = []
 
 BATCH_SIZE = 300
@@ -257,6 +268,8 @@ def flush_batch():
                 time.sleep(3 + attempt)
 
 try:
+    driver = create_driver()
+
     for i in range(last_i, total_rows):
 
         if i % SHARD_STEP != SHARD_INDEX:
@@ -338,7 +351,8 @@ try:
 finally:
     flush_batch()
     try:
-        driver.quit()
+        if driver:
+            driver.quit()
     except:
         pass
     log("🏁 Scraping completed successfully")
