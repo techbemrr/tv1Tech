@@ -23,11 +23,12 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 
-# always create files
+# ✅ ensure files exist (so artifacts upload + no warnings)
 open(checkpoint_file, "a").close()
 open(FAILED_FILE, "a").close()
 
-# checkpoint: DONE:<i> / INPROG:<i>
+# ✅ Proper checkpoint:
+# DONE:<i> / INPROG:<i>
 def read_checkpoint():
     try:
         raw = open(checkpoint_file, "r").read().strip()
@@ -37,7 +38,7 @@ def read_checkpoint():
             return int(raw.split("INPROG:")[1].strip())
         if raw == "":
             return 0
-        return int(raw)
+        return int(raw)  # legacy fallback
     except:
         return 0
 
@@ -50,7 +51,9 @@ def write_checkpoint(tag, i):
 
 last_i = read_checkpoint()
 
+# ✅ save failed rows
 _failed_seen = set()
+
 def mark_failed(i, reason="NO_VALUES"):
     if i in _failed_seen:
         return
@@ -61,7 +64,7 @@ def mark_failed(i, reason="NO_VALUES"):
     except:
         pass
 
-# ---------------- DRIVER (ONE TIME) ---------------- #
+# ---------------- ONE DRIVER (NO RE-INJECT COOKIES EVERY ROW) ---------------- #
 def build_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
 
@@ -70,6 +73,9 @@ def build_driver():
     opts = Options()
     if os.path.exists(chrome_bin):
         opts.binary_location = chrome_bin
+        log(f"✅ Using Chrome binary: {chrome_bin}")
+    else:
+        log(f"⚠️ Chrome binary not found at {chrome_bin}, using system default...")
 
     opts.page_load_strategy = "eager"
     opts.add_argument("--headless=new")
@@ -87,6 +93,8 @@ def build_driver():
     opts.add_argument("--disable-background-timer-throttling")
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
+
+    # ✅ helps prevent hang in GH headless
     opts.add_argument("--remote-debugging-port=9222")
 
     opts.add_argument(
@@ -100,15 +108,13 @@ def build_driver():
     return driver
 
 def apply_cookies_once(driver):
-    # apply cookies ONCE only
     if not os.path.exists("cookies.json"):
         log("⚠️ cookies.json not found (running without cookies)")
-        return False
+        return
 
     try:
         driver.get("https://in.tradingview.com/")
         time.sleep(2)
-
         with open("cookies.json", "r") as f:
             cookies = json.load(f)
 
@@ -136,18 +142,16 @@ def apply_cookies_once(driver):
         driver.refresh()
         time.sleep(1)
         log(f"✅ Cookies applied successfully ({ok}/{len(cookies)})")
-        return ok > 0
     except Exception as e:
         log(f"⚠️ Cookie error: {str(e)[:160]}")
-        return False
 
 def soft_recover(driver):
-    # NO cookie reinjection, just reset to home
+    # ✅ no new browser, just reset session to home
     try:
         driver.get("https://in.tradingview.com/")
-        time.sleep(1.5)
+        time.sleep(1.2)
         driver.refresh()
-        time.sleep(1.0)
+        time.sleep(0.8)
     except:
         pass
 
@@ -158,13 +162,11 @@ VALUE_CLASS = "valueValue-l31H9iuA apply-common-tooltip"
 def scrape_tradingview(driver, url):
     try:
         driver.get(url)
-
         WebDriverWait(driver, 35).until(
             EC.visibility_of_element_located((By.XPATH, XPATH_WAIT))
         )
 
         html = driver.page_source.lower()
-        # block detection (kept same idea)
         if "captcha" in html or "access denied" in html or "sign in" in html:
             return "RESTART"
 
@@ -202,33 +204,34 @@ def scrape_with_retries(driver, url, tries=5):
 
     return []
 
-def last3(values):
-    return values[-3:] if isinstance(values, list) and len(values) >= 3 else []
-
-# ---------------- SHEETS SETUP ---------------- #
+# ---------------- INITIAL SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
+
+    # ✅ STORE TO SHEET16 (as you wanted earlier)
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
 
-    company_list_c = sheet_main.col_values(3)  # C
-    company_list_d = sheet_main.col_values(4)  # D
-    name_list = sheet_main.col_values(1)       # A
+    # ✅ READ BOTH COLUMN C + D
+    urls_c = sheet_main.col_values(3)  # C
+    urls_d = sheet_main.col_values(4)  # D
+    name_list = sheet_main.col_values(1)
 
-    total_rows = max(len(company_list_c), len(company_list_d), len(name_list))
+    total_rows = max(len(urls_c), len(urls_d), len(name_list))
+
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
-
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
+driver = None
+batch_list = []
+
 BATCH_SIZE = 300
 current_date = date.today().strftime("%m/%d/%Y")
 ROW_SLEEP = 0.03
-
-batch_list = []
 
 def flush_batch():
     global batch_list
@@ -250,7 +253,9 @@ def flush_batch():
             else:
                 time.sleep(2 + attempt)
 
-driver = None
+def last3(values):
+    return values[-3:] if isinstance(values, list) and len(values) >= 3 else []
+
 consec_restarts = 0
 MAX_CONSEC_RESTARTS = 3
 
@@ -259,13 +264,14 @@ try:
     apply_cookies_once(driver)
 
     for i in range(last_i, total_rows):
+
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
         write_checkpoint("INPROG", i)
 
-        url_c = (company_list_c[i] or "").strip() if i < len(company_list_c) else ""
-        url_d = (company_list_d[i] or "").strip() if i < len(company_list_d) else ""
+        url_c = (urls_c[i] or "").strip() if i < len(urls_c) else ""
+        url_d = (urls_d[i] or "").strip() if i < len(urls_d) else ""
         name  = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
 
         if not (url_c.startswith("http") or url_d.startswith("http")):
@@ -276,7 +282,7 @@ try:
 
         log(f"🔍 [{i+1}/{total_rows}] Scraping: {name}")
 
-        # -------- scrape C --------
+        # ---- scrape C ----
         values_c = []
         if url_c.startswith("http"):
             v = scrape_with_retries(driver, url_c, tries=5)
@@ -290,7 +296,7 @@ try:
         else:
             mark_failed(i, "BAD_URL_C")
 
-        # -------- scrape D --------
+        # ---- scrape D ----
         values_d = []
         if url_d.startswith("http"):
             v = scrape_with_retries(driver, url_d, tries=5)
@@ -304,7 +310,7 @@ try:
         else:
             mark_failed(i, "BAD_URL_D")
 
-        # if too many restarts, do ONE hard restart (cookies not re-added every time)
+        # hard restart only after repeated RESTART signals
         if consec_restarts >= MAX_CONSEC_RESTARTS:
             log("♻️ Too many RESTART signals, restarting browser once...")
             try:
@@ -315,8 +321,8 @@ try:
             apply_cookies_once(driver)
             consec_restarts = 0
 
-        last3_c = last3(values_c)
-        last3_d = last3(values_d)
+        c3 = last3(values_c)
+        d3 = last3(values_d)
 
         target_row = i + 1
 
@@ -324,19 +330,19 @@ try:
         batch_list.append({"range": f"A{target_row}", "values": [[name]]})
         batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
 
-        # C -> K:M
-        if last3_c:
-            batch_list.append({"range": f"K{target_row}:M{target_row}", "values": [last3_c]})
+        # ✅ store ONLY LAST 3 values for each link
+        # C -> K:M, D -> N:P
+        if c3:
+            batch_list.append({"range": f"K{target_row}:M{target_row}", "values": [c3]})
         else:
             mark_failed(i, "NO_LAST3_C")
 
-        # D -> N:P
-        if last3_d:
-            batch_list.append({"range": f"N{target_row}:P{target_row}", "values": [last3_d]})
+        if d3:
+            batch_list.append({"range": f"N{target_row}:P{target_row}", "values": [d3]})
         else:
             mark_failed(i, "NO_LAST3_D")
 
-        log(f"✅ C_last3={len(last3_c)} | D_last3={len(last3_d)} | Buffered: {len(batch_list)}/{BATCH_SIZE}")
+        log(f"✅ C_last3={len(c3)} | D_last3={len(d3)} | Buffered: {len(batch_list)}/{BATCH_SIZE}")
 
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
