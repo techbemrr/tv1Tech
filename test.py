@@ -85,7 +85,7 @@ def create_driver():
             time.sleep(1)
             log("✅ Cookies applied successfully")
         except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:80]}")
+            log(f"⚠️ Cookie error: {str(e)[:120]}")
 
     return driver
 
@@ -112,10 +112,16 @@ def scrape_tradingview(driver, url):
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
-def scrape_with_retry(driver, url):
+def scrape_with_retry(driver, url, label=""):
     """Retry once if empty. Returns list, [] or 'RESTART'."""
+    if label:
+        log(f"   🌐 {label} visiting...")
+    else:
+        log("   🌐 visiting...")
+
     values = scrape_tradingview(driver, url)
     if values == []:
+        log(f"   ⚠️ {label} got empty values, refreshing once...")
         try:
             driver.refresh()
             time.sleep(0.7)
@@ -129,11 +135,13 @@ log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
+
+    # ✅ TARGET: MV2 for SQL -> Sheet16
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
 
     name_list = sheet_main.col_values(1)      # Names
-    url_list_c = sheet_main.col_values(3)     # ✅ Column C links
-    url_list_d = sheet_main.col_values(4)     # ✅ Column D links
+    url_list_c = sheet_main.col_values(3)     # Column C links
+    url_list_d = sheet_main.col_values(4)     # Column D links
 
     total_rows = max(len(name_list), len(url_list_c), len(url_list_d))
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
@@ -143,116 +151,174 @@ except Exception as e:
 
 # ---------------- MAIN LOOP ---------------- #
 driver = create_driver()
+
+# Buffer of cell updates
 batch_list = []
 
+# ✅ Bigger batch = fewer API calls
 BATCH_SIZE = 300
+
+# ✅ Date once
 current_date = date.today().strftime("%m/%d/%Y")
+
 ROW_SLEEP = 0.05
 
-def flush_batch():
-    global batch_list
+# ✅ Accurate counters for “show everything”
+rows_buffered = 0
+total_rows_processed = 0
+total_flushes = 0
+
+def flush_batch(reason=""):
+    """Flush buffered cell updates to Google Sheets (batch_update)."""
+    global batch_list, rows_buffered, total_flushes
     if not batch_list:
+        log("📭 Flush skipped (buffer empty)")
         return
-    for attempt in range(3):
+
+    log(f"🚚 FLUSH START {('('+reason+')') if reason else ''} | "
+        f"Updates={len(batch_list)} | RowsBuffered={rows_buffered}")
+
+    for attempt in range(1, 4):
         try:
             sheet_data.batch_update(batch_list)
-            log(f"🚀 Saved {len(batch_list)} updates")
+            total_flushes += 1
+            log(f"🚀 FLUSH OK | Saved {len(batch_list)} updates | "
+                f"RowsBuffered={rows_buffered} | FlushCount={total_flushes}")
             batch_list = []
+            rows_buffered = 0
             return
         except Exception as e:
             msg = str(e)
-            log(f"⚠️ API Error: {msg[:160]}")
+            log(f"⚠️ FLUSH ERROR (attempt {attempt}/3): {msg[:200]}")
             if "429" in msg:
                 log("⏳ Quota hit, sleeping 60s...")
                 time.sleep(60)
             else:
                 time.sleep(3)
 
+    log("🛑 FLUSH FAILED after 3 attempts (buffer retained, will retry later)")
+
 def safe_get(lst, idx):
     return (lst[idx] if idx < len(lst) else "").strip()
+
+def log_buffer_state(extra=""):
+    updates = len(batch_list)
+    remaining = max(BATCH_SIZE - updates, 0)
+    msg = (f"📦 BUFFER STATE | Updates={updates}/{BATCH_SIZE} | "
+           f"RowsBuffered={rows_buffered} | RemainingToFlush={remaining}")
+    if extra:
+        msg += f" | {extra}"
+    log(msg)
 
 try:
     for i in range(last_i, total_rows):
 
-        # ✅ Keep sharding
+        # ✅ Sharding
         if i % SHARD_STEP != SHARD_INDEX:
             continue
+
+        total_rows_processed += 1
 
         name = safe_get(name_list, i) or f"Row {i+1}"
         url_c = safe_get(url_list_c, i)   # Column C
         url_d = safe_get(url_list_d, i)   # Column D
-
         target_row = i + 1
-        log(f"🔍 [{target_row}/{total_rows}] Scraping: {name}")
 
-        combined_values = []
+        log("")
+        log("====================================================")
+        log(f"🔍 ROW START | Index={target_row}/{total_rows} | Name={name} | "
+            f"Shard={SHARD_INDEX}/{SHARD_STEP} | CheckpointFrom={last_i}")
+        log(f"🔗 Links | C='{url_c[:90]}' | D='{url_d[:90]}'")
 
-        # ---------- SCRAPE COLUMN C LINK ----------
+        # ---------- SCRAPE COLUMN C ----------
         values_c = []
         if url_c.startswith("http"):
-            log(f"   🌐 C link visiting...")
-            values_c = scrape_with_retry(driver, url_c)
-
+            values_c = scrape_with_retry(driver, url_c, label="C link")
             if values_c == "RESTART":
+                log("🧯 RESTART needed (during C). Rebuilding browser...")
                 try:
                     driver.quit()
                 except:
                     pass
                 driver = create_driver()
-                values_c = scrape_with_retry(driver, url_c)
+                values_c = scrape_with_retry(driver, url_c, label="C link (after restart)")
                 if values_c == "RESTART":
+                    log("🛑 C still failing after restart, treating as empty.")
                     values_c = []
         else:
-            log(f"   ⏭️ C link invalid/blank")
+            log("   ⏭️ C link invalid/blank -> skipped")
 
-        # ---------- SCRAPE COLUMN D LINK ----------
+        # ---------- SCRAPE COLUMN D ----------
         values_d = []
         if url_d.startswith("http"):
-            log(f"   🌐 D link visiting...")
-            values_d = scrape_with_retry(driver, url_d)
-
+            values_d = scrape_with_retry(driver, url_d, label="D link")
             if values_d == "RESTART":
+                log("🧯 RESTART needed (during D). Rebuilding browser...")
                 try:
                     driver.quit()
                 except:
                     pass
                 driver = create_driver()
-                values_d = scrape_with_retry(driver, url_d)
+                values_d = scrape_with_retry(driver, url_d, label="D link (after restart)")
                 if values_d == "RESTART":
+                    log("🛑 D still failing after restart, treating as empty.")
                     values_d = []
         else:
-            log(f"   ⏭️ D link invalid/blank")
+            log("   ⏭️ D link invalid/blank -> skipped")
 
-        # ✅ COMBINE: C values + D values (single merged array)
+        # ---------- COMBINE ----------
+        combined_values = []
         if isinstance(values_c, list) and values_c:
             combined_values.extend(values_c)
         if isinstance(values_d, list) and values_d:
             combined_values.extend(values_d)
 
-        # ---------- WRITE OUTPUT ----------
-        # ✅ Always write name/date. Values only if combined has data.
+        log(f"📌 SCRAPE RESULT | C={len(values_c) if isinstance(values_c, list) else 0} "
+            f"| D={len(values_d) if isinstance(values_d, list) else 0} "
+            f"| Combined={len(combined_values)}")
+
+        # ---------- WRITE BUFFER ----------
+        # Always write Name + Date
         batch_list.append({"range": f"A{target_row}", "values": [[name]]})
         batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
 
         if combined_values:
             batch_list.append({"range": f"K{target_row}", "values": [combined_values]})
-            log(f"✅ Combined values: {len(combined_values)} cells (C:{len(values_c)} + D:{len(values_d)})")
+            log(f"📝 BUFFER APPEND | A{target_row}, J{target_row}, K{target_row}.. "
+                f"| AddedUpdates=3")
         else:
-            log(f"⚠️ No values found from both links (C:{len(values_c)} + D:{len(values_d)})")
+            log(f"📝 BUFFER APPEND | A{target_row}, J{target_row} "
+                f"| AddedUpdates=2 (no combined values)")
 
+        rows_buffered += 1
+
+        # show buffer state every row
+        log_buffer_state(extra=f"After row {target_row}")
+
+        # ---------- FLUSH WHEN FULL ----------
         if len(batch_list) >= BATCH_SIZE:
-            flush_batch()
+            flush_batch(reason="BATCH_SIZE reached")
+            log_buffer_state(extra="After flush")
 
+        # ---------- CHECKPOINT ----------
         with open(checkpoint_file, "w") as f:
             f.write(str(i + 1))
+        log(f"💾 CHECKPOINT saved -> {i+1} (file: {checkpoint_file})")
+
+        log(f"✅ ROW END | ProcessedInThisRun={total_rows_processed} | FlushCount={total_flushes}")
+        log("====================================================")
 
         if ROW_SLEEP:
             time.sleep(ROW_SLEEP)
 
 finally:
-    flush_batch()
+    # Final flush
+    flush_batch(reason="finalize")
+    log_buffer_state(extra="After final flush")
+
     try:
         driver.quit()
     except:
         pass
-    log("🏁 Scraping completed successfully")
+
+    log(f"🏁 DONE | TotalProcessed={total_rows_processed} | TotalFlushes={total_flushes}")
