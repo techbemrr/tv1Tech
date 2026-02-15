@@ -23,19 +23,12 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 
-# ✅ ensure files exist ALWAYS (so artifact upload works)
-try:
-    open(checkpoint_file, "a").close()
-    open(FAILED_FILE, "a").close()
-except:
-    pass
+# always create files
+open(checkpoint_file, "a").close()
+open(FAILED_FILE, "a").close()
 
-# ✅ Proper checkpoint format:
-# DONE:<index>   => last fully completed index
-# INPROG:<index> => currently working index (not completed)
+# checkpoint: DONE:<i> / INPROG:<i>
 def read_checkpoint():
-    if not os.path.exists(checkpoint_file):
-        return 0
     try:
         raw = open(checkpoint_file, "r").read().strip()
         if raw.startswith("DONE:"):
@@ -44,21 +37,14 @@ def read_checkpoint():
             return int(raw.split("INPROG:")[1].strip())
         if raw == "":
             return 0
-        return int(raw)  # legacy fallback
+        return int(raw)
     except:
         return 0
 
-def write_checkpoint_inprog(i):
+def write_checkpoint(tag, i):
     try:
         with open(checkpoint_file, "w") as f:
-            f.write(f"INPROG:{i}")
-    except:
-        pass
-
-def write_checkpoint_done(i):
-    try:
-        with open(checkpoint_file, "w") as f:
-            f.write(f"DONE:{i}")
+            f.write(f"{tag}:{i}")
     except:
         pass
 
@@ -75,21 +61,15 @@ def mark_failed(i, reason="NO_VALUES"):
     except:
         pass
 
-# ---------------- BROWSER FACTORY ---------------- #
-def create_driver():
+# ---------------- DRIVER (ONE TIME) ---------------- #
+def build_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
 
-    # ✅ Use Google Chrome that already exists on GitHub runners
-    # You can override via env if needed.
     chrome_bin = os.getenv("CHROME_BINARY", "/usr/bin/google-chrome")
 
     opts = Options()
     if os.path.exists(chrome_bin):
         opts.binary_location = chrome_bin
-        log(f"✅ Using Chrome binary: {chrome_bin}")
-    else:
-        # fallback: try without binary_location (selenium manager may find it)
-        log(f"⚠️ Chrome binary not found at {chrome_bin}, trying system default...")
 
     opts.page_load_strategy = "eager"
     opts.add_argument("--headless=new")
@@ -107,8 +87,6 @@ def create_driver():
     opts.add_argument("--disable-background-timer-throttling")
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
-
-    # ✅ helps prevent hang in GH headless
     opts.add_argument("--remote-debugging-port=9222")
 
     opts.add_argument(
@@ -117,81 +95,94 @@ def create_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # ✅ IMPORTANT: no chromedriver path here.
-    # Selenium Manager will auto-download matching driver.
     driver = webdriver.Chrome(options=opts)
     driver.set_page_load_timeout(45)
-
-    # ---- COOKIE LOGIC (safe + domain forced) ----
-    if os.path.exists("cookies.json"):
-        try:
-            driver.get("https://in.tradingview.com/")
-            time.sleep(2)
-
-            with open("cookies.json", "r") as f:
-                cookies = json.load(f)
-
-            ok = 0
-            for c in cookies:
-                try:
-                    cc = {
-                        "name": c.get("name"),
-                        "value": c.get("value"),
-                        "path": c.get("path", "/"),
-                        "secure": bool(c.get("secure", False)),
-                        "httpOnly": bool(c.get("httpOnly", False)),
-                        "domain": "in.tradingview.com",
-                    }
-                    if "expiry" in c:
-                        try:
-                            cc["expiry"] = int(c["expiry"])
-                        except:
-                            pass
-                    driver.add_cookie(cc)
-                    ok += 1
-                except:
-                    continue
-
-            driver.refresh()
-            time.sleep(1)
-            log(f"✅ Cookies applied successfully ({ok}/{len(cookies)})")
-        except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:160]}")
-    else:
-        log("⚠️ cookies.json not found (running without cookies)")
-
     return driver
 
+def apply_cookies_once(driver):
+    # apply cookies ONCE only
+    if not os.path.exists("cookies.json"):
+        log("⚠️ cookies.json not found (running without cookies)")
+        return False
+
+    try:
+        driver.get("https://in.tradingview.com/")
+        time.sleep(2)
+
+        with open("cookies.json", "r") as f:
+            cookies = json.load(f)
+
+        ok = 0
+        for c in cookies:
+            try:
+                cc = {
+                    "name": c.get("name"),
+                    "value": c.get("value"),
+                    "path": c.get("path", "/"),
+                    "secure": bool(c.get("secure", False)),
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "domain": "in.tradingview.com",
+                }
+                if "expiry" in c:
+                    try:
+                        cc["expiry"] = int(c["expiry"])
+                    except:
+                        pass
+                driver.add_cookie(cc)
+                ok += 1
+            except:
+                continue
+
+        driver.refresh()
+        time.sleep(1)
+        log(f"✅ Cookies applied successfully ({ok}/{len(cookies)})")
+        return ok > 0
+    except Exception as e:
+        log(f"⚠️ Cookie error: {str(e)[:160]}")
+        return False
+
+def soft_recover(driver):
+    # NO cookie reinjection, just reset to home
+    try:
+        driver.get("https://in.tradingview.com/")
+        time.sleep(1.5)
+        driver.refresh()
+        time.sleep(1.0)
+    except:
+        pass
+
 # ---------------- SCRAPER LOGIC ---------------- #
-# ✅ DO NOT CHANGE: your exact XPATH + your exact class parsing kept as-is
+XPATH_WAIT = '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
+VALUE_CLASS = "valueValue-l31H9iuA apply-common-tooltip"
+
 def scrape_tradingview(driver, url):
     try:
         driver.get(url)
-        WebDriverWait(driver, 45).until(
-            EC.visibility_of_element_located((
-                By.XPATH,
-                '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
-            ))
+
+        WebDriverWait(driver, 35).until(
+            EC.visibility_of_element_located((By.XPATH, XPATH_WAIT))
         )
 
         html = driver.page_source.lower()
+        # block detection (kept same idea)
         if "captcha" in html or "access denied" in html or "sign in" in html:
             return "RESTART"
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
         values = [
             el.get_text().replace('−', '-').replace('∅', 'None')
-            for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+            for el in soup.find_all("div", class_=VALUE_CLASS)
         ]
         return values
+
     except (TimeoutException, NoSuchElementException):
         return []
     except WebDriverException:
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
-def scrape_with_retries(driver, url, tries=7):
-    delay = 1.0
+def scrape_with_retries(driver, url, tries=5):
+    delay = 0.8
     for _ in range(tries):
         values = scrape_tradingview(driver, url)
 
@@ -206,43 +197,38 @@ def scrape_with_retries(driver, url, tries=7):
         except:
             pass
 
-        time.sleep(delay + random.uniform(0.1, 0.7))
-        delay = min(delay * 1.7, 12)
+        time.sleep(delay + random.uniform(0.1, 0.6))
+        delay = min(delay * 1.6, 8)
 
     return []
 
 def last3(values):
-    if isinstance(values, list) and len(values) >= 3:
-        return values[-3:]
-    return []
+    return values[-3:] if isinstance(values, list) and len(values) >= 3 else []
 
-# ---------------- INITIAL SETUP ---------------- #
+# ---------------- SHEETS SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
-
-    # ✅ store to Sheet16
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
 
-    # ✅ read BOTH column C and D
     company_list_c = sheet_main.col_values(3)  # C
     company_list_d = sheet_main.col_values(4)  # D
     name_list = sheet_main.col_values(1)       # A
 
     total_rows = max(len(company_list_c), len(company_list_d), len(name_list))
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
+
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
-driver = None
-batch_list = []
-
 BATCH_SIZE = 300
 current_date = date.today().strftime("%m/%d/%Y")
-ROW_SLEEP = 0.05
+ROW_SLEEP = 0.03
+
+batch_list = []
 
 def flush_batch():
     global batch_list
@@ -258,21 +244,25 @@ def flush_batch():
             msg = str(e)
             log(f"⚠️ API Error: {msg[:160]}")
             if "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
-                sleep_s = 60 + (SHARD_INDEX * 7)
+                sleep_s = 45 + (SHARD_INDEX * 5)
                 log(f"⏳ Quota hit, sleeping {sleep_s}s...")
                 time.sleep(sleep_s)
             else:
-                time.sleep(3 + attempt)
+                time.sleep(2 + attempt)
+
+driver = None
+consec_restarts = 0
+MAX_CONSEC_RESTARTS = 3
 
 try:
-    driver = create_driver()
+    driver = build_driver()
+    apply_cookies_once(driver)
 
     for i in range(last_i, total_rows):
-
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        write_checkpoint_inprog(i)
+        write_checkpoint("INPROG", i)
 
         url_c = (company_list_c[i] or "").strip() if i < len(company_list_c) else ""
         url_d = (company_list_d[i] or "").strip() if i < len(company_list_d) else ""
@@ -281,38 +271,49 @@ try:
         if not (url_c.startswith("http") or url_d.startswith("http")):
             log(f"⏭️ Row {i+1}: invalid/blank URL in both C/D -> skipped")
             mark_failed(i, "BAD_URL_BOTH")
-            write_checkpoint_done(i)
+            write_checkpoint("DONE", i)
             continue
 
         log(f"🔍 [{i+1}/{total_rows}] Scraping: {name}")
 
-        # ---- scrape C ----
+        # -------- scrape C --------
         values_c = []
         if url_c.startswith("http"):
-            values_c = scrape_with_retries(driver, url_c, tries=7)
-            if values_c == "RESTART":
-                try: driver.quit()
-                except: pass
-                driver = create_driver()
-                values_c = scrape_with_retries(driver, url_c, tries=5)
-                if values_c == "RESTART":
-                    values_c = []
+            v = scrape_with_retries(driver, url_c, tries=5)
+            if v == "RESTART":
+                consec_restarts += 1
+                soft_recover(driver)
+                values_c = []
+            else:
+                consec_restarts = 0
+                values_c = v
         else:
             mark_failed(i, "BAD_URL_C")
 
-        # ---- scrape D ----
+        # -------- scrape D --------
         values_d = []
         if url_d.startswith("http"):
-            values_d = scrape_with_retries(driver, url_d, tries=7)
-            if values_d == "RESTART":
-                try: driver.quit()
-                except: pass
-                driver = create_driver()
-                values_d = scrape_with_retries(driver, url_d, tries=5)
-                if values_d == "RESTART":
-                    values_d = []
+            v = scrape_with_retries(driver, url_d, tries=5)
+            if v == "RESTART":
+                consec_restarts += 1
+                soft_recover(driver)
+                values_d = []
+            else:
+                consec_restarts = 0
+                values_d = v
         else:
             mark_failed(i, "BAD_URL_D")
+
+        # if too many restarts, do ONE hard restart (cookies not re-added every time)
+        if consec_restarts >= MAX_CONSEC_RESTARTS:
+            log("♻️ Too many RESTART signals, restarting browser once...")
+            try:
+                driver.quit()
+            except:
+                pass
+            driver = build_driver()
+            apply_cookies_once(driver)
+            consec_restarts = 0
 
         last3_c = last3(values_c)
         last3_d = last3(values_d)
@@ -340,7 +341,7 @@ try:
         if len(batch_list) >= BATCH_SIZE:
             flush_batch()
 
-        write_checkpoint_done(i)
+        write_checkpoint("DONE", i)
 
         if ROW_SLEEP:
             time.sleep(ROW_SLEEP)
