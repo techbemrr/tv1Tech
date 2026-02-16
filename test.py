@@ -17,22 +17,48 @@ from webdriver_manager.chrome import ChromeDriverManager
 def log(msg):
     print(msg, flush=True)
 
-# ---------------- CONFIG & SHARDING ---------------- #
+# =========================
+# CONFIG & SHARDING
+# =========================
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
 
-# ✅ Speed: resolve chromedriver path ONCE (restart will reuse it)
+# ✅ Resolve chromedriver path ONCE (fast restarts)
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-# ---------------- BROWSER FACTORY ---------------- #
+# ✅ Buffer target: keep same “batch_update” approach, just optimized
+BATCH_SIZE_UPDATES = 300          # flush when buffered updates reach this
+CHECKPOINT_EVERY = 10             # write checkpoint every N processed rows (less disk IO)
+ROW_SLEEP = 0.05                  # keep your throttling
+
+# =========================
+# HELPERS: CLEAN + LAST 3
+# =========================
+def clean_cell_text(s: str) -> str:
+    # removes ALL whitespace (spaces, tabs, newlines)
+    return "".join(str(s).split())
+
+def clean_list(values):
+    return [clean_cell_text(v) for v in values if str(v).strip() != ""]
+
+def last_three(values):
+    vals = clean_list(values)
+    return vals[-3:] if len(vals) >= 3 else vals
+
+def safe_get(lst, idx):
+    return (lst[idx] if idx < len(lst) else "").strip()
+
+# =========================
+# BROWSER FACTORY
+# =========================
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
     opts = Options()
 
-    # ✅ Faster: don't wait for full page assets
+    # Faster: don't wait for full assets
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -43,7 +69,6 @@ def create_driver():
     opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
 
-    # ✅ small extra speed/consistency flags (no extractor change)
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--disable-extensions")
@@ -58,13 +83,10 @@ def create_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    driver = webdriver.Chrome(
-        service=Service(CHROME_DRIVER_PATH),
-        options=opts
-    )
+    driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     driver.set_page_load_timeout(40)
 
-    # ---- COOKIE LOGIC ----
+    # ---- COOKIE LOGIC (same) ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
@@ -89,8 +111,9 @@ def create_driver():
 
     return driver
 
-# ---------------- SCRAPER LOGIC ---------------- #
-# ❌ NOT CHANGED (as you asked)
+# =========================
+# SCRAPER LOGIC (MAIN LOGIC NOT CHANGED)
+# =========================
 def scrape_tradingview(driver, url):
     try:
         driver.get(url)
@@ -113,7 +136,6 @@ def scrape_tradingview(driver, url):
         return "RESTART"
 
 def scrape_with_retry(driver, url, label=""):
-    """Retry once if empty. Returns list, [] or 'RESTART'."""
     if label:
         log(f"   🌐 {label} visiting...")
     else:
@@ -130,35 +152,24 @@ def scrape_with_retry(driver, url, label=""):
         values = scrape_tradingview(driver, url)
     return values
 
-# ---------------- HELPERS: CLEAN + LAST 3 ---------------- #
-def clean_cell_text(s: str) -> str:
-    # removes ALL whitespace (spaces, tabs, newlines)
-    return "".join(str(s).split())
-
-def clean_list(values):
-    return [clean_cell_text(v) for v in values if str(v).strip() != ""]
-
-def last_three(values):
-    vals = clean_list(values)
-    return vals[-3:] if len(vals) >= 3 else vals
-
-# ---------------- INITIAL SETUP ---------------- #
+# =========================
+# SHEETS SETUP
+# =========================
 log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
-
-    # ✅ TARGET: MV2 for SQL -> Sheet16
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet16")
 
-    name_list = sheet_main.col_values(1)      # Names
-    url_list_c = sheet_main.col_values(3)     # Column C links
-    url_list_d = sheet_main.col_values(4)     # Column D links
+    # Read once
+    name_list = sheet_main.col_values(1)
+    url_list_c = sheet_main.col_values(3)
+    url_list_d = sheet_main.col_values(4)
 
     total_rows = max(len(name_list), len(url_list_c), len(url_list_d))
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
 
-    # ✅ ensure Sheet16 has enough rows BEFORE loop
+    # Ensure enough rows in target sheet (prevents grid limit crash)
     needed_rows = total_rows + 10
     if sheet_data.row_count < needed_rows:
         log(f"🧱 Resizing Sheet16 rows: {sheet_data.row_count} -> {needed_rows}")
@@ -168,56 +179,50 @@ except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
 
-# ---------------- MAIN LOOP ---------------- #
+# =========================
+# BUFFER + FLUSH (OPTIMIZED)
+# =========================
 driver = create_driver()
-
-# Buffer of cell updates
 batch_list = []
 
-# ✅ Buffer size = 300 (as you asked)
-BATCH_SIZE = 300
-
-# ✅ Date once
 current_date = date.today().strftime("%m/%d/%Y")
 
-ROW_SLEEP = 0.05
-
-# ✅ Accurate counters for “show everything”
 rows_buffered = 0
 total_rows_processed = 0
 total_flushes = 0
+_last_checkpoint_written = last_i
 
 def _clean_ranges(updates):
     """
-    Safety: if after a failed attempt ranges become like 'Sheet16!A1' or even duplicated,
-    keep only the last A1 part so worksheet.batch_update doesn't prepend the title again.
+    Prevent range corruption like: 'Sheet16'!'Sheet16'!A16
+    Keep only A1 part; worksheet.batch_update will apply sheet context.
     """
     cleaned = []
     for u in updates:
         r = u.get("range", "")
         if "!" in r:
-            r = r.split("!")[-1]  # keep A1 only
+            r = r.split("!")[-1]
         cleaned.append({"range": r, "values": u.get("values", [[]])})
     return cleaned
 
 def flush_batch(reason=""):
-    """Flush buffered cell updates to Google Sheets (batch_update)."""
     global batch_list, rows_buffered, total_flushes
+
     if not batch_list:
-        log("📭 Flush skipped (buffer empty)")
         return
 
-    log(f"🚚 FLUSH START {('('+reason+')') if reason else ''} | "
-        f"Updates={len(batch_list)} | RowsBuffered={rows_buffered}")
+    log(f"🚚 FLUSH START {('('+reason+')') if reason else ''} | Updates={len(batch_list)} | RowsBuffered={rows_buffered}")
+
+    # Backoff strategy (fast->slow)
+    backoffs = [2, 5, 15]
 
     for attempt in range(1, 4):
         try:
             payload = _clean_ranges(batch_list)
             sheet_data.batch_update(payload)
-
             total_flushes += 1
-            log(f"🚀 FLUSH OK | Saved {len(payload)} updates | "
-                f"RowsBuffered={rows_buffered} | FlushCount={total_flushes}")
+
+            log(f"🚀 FLUSH OK | Saved {len(payload)} updates | RowsBuffered={rows_buffered} | FlushCount={total_flushes}")
 
             batch_list = []
             rows_buffered = 0
@@ -225,11 +230,12 @@ def flush_batch(reason=""):
 
         except Exception as e:
             msg = str(e)
-            log(f"⚠️ FLUSH ERROR (attempt {attempt}/3): {msg[:200]}")
+            log(f"⚠️ FLUSH ERROR (attempt {attempt}/3): {msg[:220]}")
 
+            # Grid limit -> expand rows and retry
             if "exceeds grid limits" in msg.lower():
                 try:
-                    new_rows = max(sheet_data.row_count + 500, total_rows + 10)
+                    new_rows = max(sheet_data.row_count + 800, total_rows + 10)
                     log(f"🧱 Auto-resize on grid limit: {sheet_data.row_count} -> {new_rows}")
                     sheet_data.resize(rows=new_rows)
                 except Exception as ee:
@@ -239,58 +245,55 @@ def flush_batch(reason=""):
                 log("⏳ Quota hit, sleeping 60s...")
                 time.sleep(60)
             else:
-                time.sleep(3)
+                time.sleep(backoffs[attempt - 1])
 
     log("🛑 FLUSH FAILED after 3 attempts (buffer retained, will retry later)")
 
-def safe_get(lst, idx):
-    return (lst[idx] if idx < len(lst) else "").strip()
-
-def log_buffer_state(extra=""):
-    updates = len(batch_list)
-    remaining = max(BATCH_SIZE - updates, 0)
-    msg = (f"📦 BUFFER STATE | Updates={updates}/{BATCH_SIZE} | "
-           f"RowsBuffered={rows_buffered} | RemainingToFlush={remaining}")
-    if extra:
-        msg += f" | {extra}"
-    log(msg)
+def maybe_checkpoint(i_plus_1, force=False):
+    """Write checkpoint less frequently (faster) but still safe."""
+    global _last_checkpoint_written
+    if force or (i_plus_1 - _last_checkpoint_written) >= CHECKPOINT_EVERY:
+        try:
+            with open(checkpoint_file, "w") as f:
+                f.write(str(i_plus_1))
+            _last_checkpoint_written = i_plus_1
+            log(f"💾 CHECKPOINT saved -> {i_plus_1} (file: {checkpoint_file})")
+        except Exception as e:
+            log(f"⚠️ CHECKPOINT write failed: {str(e)[:120]}")
 
 try:
     for i in range(last_i, total_rows):
 
-        # ✅ Sharding
+        # Sharding (same logic)
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
         total_rows_processed += 1
 
         name = safe_get(name_list, i) or f"Row {i+1}"
-        url_c = safe_get(url_list_c, i)   # Column C
-        url_d = safe_get(url_list_d, i)   # Column D
+        url_c = safe_get(url_list_c, i)
+        url_d = safe_get(url_list_d, i)
         target_row = i + 1
 
-        # ✅ Extra safety: ensure rows exist right before write
+        # Ensure target row exists (rare if sheet expanded above)
         if target_row > sheet_data.row_count:
-            grow_to = target_row + 200
+            grow_to = target_row + 300
             log(f"🧱 Growing Sheet16 for row {target_row}: {sheet_data.row_count} -> {grow_to}")
             sheet_data.resize(rows=grow_to)
 
         log("")
         log("====================================================")
-        log(f"🔍 ROW START | Index={target_row}/{total_rows} | Name={name} | "
-            f"Shard={SHARD_INDEX}/{SHARD_STEP} | CheckpointFrom={last_i}")
+        log(f"🔍 ROW START | Index={target_row}/{total_rows} | Name={name} | Shard={SHARD_INDEX}/{SHARD_STEP} | CheckpointFrom={last_i}")
         log(f"🔗 Links | C='{url_c[:90]}' | D='{url_d[:90]}'")
 
-        # ---------- SCRAPE COLUMN C ----------
+        # ---- Scrape C ----
         values_c = []
         if url_c.startswith("http"):
             values_c = scrape_with_retry(driver, url_c, label="C link")
             if values_c == "RESTART":
                 log("🧯 RESTART needed (during C). Rebuilding browser...")
-                try:
-                    driver.quit()
-                except:
-                    pass
+                try: driver.quit()
+                except: pass
                 driver = create_driver()
                 values_c = scrape_with_retry(driver, url_c, label="C link (after restart)")
                 if values_c == "RESTART":
@@ -299,16 +302,14 @@ try:
         else:
             log("   ⏭️ C link invalid/blank -> skipped")
 
-        # ---------- SCRAPE COLUMN D ----------
+        # ---- Scrape D ----
         values_d = []
         if url_d.startswith("http"):
             values_d = scrape_with_retry(driver, url_d, label="D link")
             if values_d == "RESTART":
                 log("🧯 RESTART needed (during D). Rebuilding browser...")
-                try:
-                    driver.quit()
-                except:
-                    pass
+                try: driver.quit()
+                except: pass
                 driver = create_driver()
                 values_d = scrape_with_retry(driver, url_d, label="D link (after restart)")
                 if values_d == "RESTART":
@@ -317,16 +318,14 @@ try:
         else:
             log("   ⏭️ D link invalid/blank -> skipped")
 
-        # ---------- COMBINE (last 3 of C + last 3 of D, whitespace removed) ----------
+        # ---- Combine: ONLY last 3 of C + last 3 of D, and remove whitespace ----
         c_last3 = last_three(values_c if isinstance(values_c, list) else [])
         d_last3 = last_three(values_d if isinstance(values_d, list) else [])
         combined_values = c_last3 + d_last3
 
-        log(f"📌 SCRAPE RESULT | C={len(values_c) if isinstance(values_c, list) else 0} "
-            f"| D={len(values_d) if isinstance(values_d, list) else 0} "
-            f"| Combined={len(combined_values)}")
+        log(f"📌 SCRAPE RESULT | C={len(values_c) if isinstance(values_c, list) else 0} | D={len(values_d) if isinstance(values_d, list) else 0} | Combined={len(combined_values)}")
 
-        # ---------- WRITE BUFFER ----------
+        # ---- Buffer updates (same write logic) ----
         batch_list.append({"range": f"A{target_row}", "values": [[name]]})
         batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
 
@@ -337,17 +336,13 @@ try:
             log(f"📝 BUFFER APPEND | A{target_row}, J{target_row} | AddedUpdates=2 (no combined values)")
 
         rows_buffered += 1
-        log_buffer_state(extra=f"After row {target_row}")
 
-        # ---------- FLUSH WHEN FULL ----------
-        if len(batch_list) >= BATCH_SIZE:
+        # Flush when enough updates buffered (keeps your approach)
+        if len(batch_list) >= BATCH_SIZE_UPDATES:
             flush_batch(reason="BATCH_SIZE reached")
-            log_buffer_state(extra="After flush")
 
-        # ---------- CHECKPOINT ----------
-        with open(checkpoint_file, "w") as f:
-            f.write(str(i + 1))
-        log(f"💾 CHECKPOINT saved -> {i+1} (file: {checkpoint_file})")
+        # checkpoint less frequently (faster)
+        maybe_checkpoint(i + 1, force=False)
 
         log(f"✅ ROW END | ProcessedInThisRun={total_rows_processed} | FlushCount={total_flushes}")
         log("====================================================")
@@ -356,8 +351,9 @@ try:
             time.sleep(ROW_SLEEP)
 
 finally:
+    # final flush + final checkpoint
     flush_batch(reason="finalize")
-    log_buffer_state(extra="After final flush")
+    maybe_checkpoint(_last_checkpoint_written, force=True)
 
     try:
         driver.quit()
