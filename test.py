@@ -130,6 +130,18 @@ def scrape_with_retry(driver, url, label=""):
         values = scrape_tradingview(driver, url)
     return values
 
+# ---------------- HELPERS: CLEAN + LAST 3 ---------------- #
+def clean_cell_text(s: str) -> str:
+    # removes ALL whitespace (spaces, tabs, newlines)
+    return "".join(str(s).split())
+
+def clean_list(values):
+    return [clean_cell_text(v) for v in values if str(v).strip() != ""]
+
+def last_three(values):
+    vals = clean_list(values)
+    return vals[-3:] if len(vals) >= 3 else vals
+
 # ---------------- INITIAL SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
@@ -146,7 +158,7 @@ try:
     total_rows = max(len(name_list), len(url_list_c), len(url_list_d))
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
 
-    # ✅ FIX 1: ensure Sheet16 has enough rows BEFORE loop (prevents A1016 grid limit crash)
+    # ✅ ensure Sheet16 has enough rows BEFORE loop
     needed_rows = total_rows + 10
     if sheet_data.row_count < needed_rows:
         log(f"🧱 Resizing Sheet16 rows: {sheet_data.row_count} -> {needed_rows}")
@@ -162,8 +174,8 @@ driver = create_driver()
 # Buffer of cell updates
 batch_list = []
 
-# ✅ FIX 2: Buffer size = 50 (as you asked)
-BATCH_SIZE = 50
+# ✅ Buffer size = 300 (as you asked)
+BATCH_SIZE = 300
 
 # ✅ Date once
 current_date = date.today().strftime("%m/%d/%Y")
@@ -200,10 +212,9 @@ def flush_batch(reason=""):
 
     for attempt in range(1, 4):
         try:
-            # ✅ keep ranges clean every attempt
             payload = _clean_ranges(batch_list)
-
             sheet_data.batch_update(payload)
+
             total_flushes += 1
             log(f"🚀 FLUSH OK | Saved {len(payload)} updates | "
                 f"RowsBuffered={rows_buffered} | FlushCount={total_flushes}")
@@ -216,10 +227,8 @@ def flush_batch(reason=""):
             msg = str(e)
             log(f"⚠️ FLUSH ERROR (attempt {attempt}/3): {msg[:200]}")
 
-            # ✅ If it's grid-limit related, resize and retry immediately
             if "exceeds grid limits" in msg.lower():
                 try:
-                    # grow by buffer so it won't hit again
                     new_rows = max(sheet_data.row_count + 500, total_rows + 10)
                     log(f"🧱 Auto-resize on grid limit: {sheet_data.row_count} -> {new_rows}")
                     sheet_data.resize(rows=new_rows)
@@ -308,12 +317,10 @@ try:
         else:
             log("   ⏭️ D link invalid/blank -> skipped")
 
-        # ---------- COMBINE ----------
-        combined_values = []
-        if isinstance(values_c, list) and values_c:
-            combined_values.extend(values_c)
-        if isinstance(values_d, list) and values_d:
-            combined_values.extend(values_d)
+        # ---------- COMBINE (last 3 of C + last 3 of D, whitespace removed) ----------
+        c_last3 = last_three(values_c if isinstance(values_c, list) else [])
+        d_last3 = last_three(values_d if isinstance(values_d, list) else [])
+        combined_values = c_last3 + d_last3
 
         log(f"📌 SCRAPE RESULT | C={len(values_c) if isinstance(values_c, list) else 0} "
             f"| D={len(values_d) if isinstance(values_d, list) else 0} "
