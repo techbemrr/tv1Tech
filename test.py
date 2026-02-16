@@ -145,6 +145,13 @@ try:
 
     total_rows = max(len(name_list), len(url_list_c), len(url_list_d))
     log(f"✅ Setup complete | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume index {last_i} | Total {total_rows}")
+
+    # ✅ FIX 1: ensure Sheet16 has enough rows BEFORE loop (prevents A1016 grid limit crash)
+    needed_rows = total_rows + 10
+    if sheet_data.row_count < needed_rows:
+        log(f"🧱 Resizing Sheet16 rows: {sheet_data.row_count} -> {needed_rows}")
+        sheet_data.resize(rows=needed_rows)
+
 except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
@@ -155,8 +162,8 @@ driver = create_driver()
 # Buffer of cell updates
 batch_list = []
 
-# ✅ Bigger batch = fewer API calls
-BATCH_SIZE = 300
+# ✅ FIX 2: Buffer size = 50 (as you asked)
+BATCH_SIZE = 50
 
 # ✅ Date once
 current_date = date.today().strftime("%m/%d/%Y")
@@ -167,6 +174,19 @@ ROW_SLEEP = 0.05
 rows_buffered = 0
 total_rows_processed = 0
 total_flushes = 0
+
+def _clean_ranges(updates):
+    """
+    Safety: if after a failed attempt ranges become like 'Sheet16!A1' or even duplicated,
+    keep only the last A1 part so worksheet.batch_update doesn't prepend the title again.
+    """
+    cleaned = []
+    for u in updates:
+        r = u.get("range", "")
+        if "!" in r:
+            r = r.split("!")[-1]  # keep A1 only
+        cleaned.append({"range": r, "values": u.get("values", [[]])})
+    return cleaned
 
 def flush_batch(reason=""):
     """Flush buffered cell updates to Google Sheets (batch_update)."""
@@ -180,16 +200,32 @@ def flush_batch(reason=""):
 
     for attempt in range(1, 4):
         try:
-            sheet_data.batch_update(batch_list)
+            # ✅ keep ranges clean every attempt
+            payload = _clean_ranges(batch_list)
+
+            sheet_data.batch_update(payload)
             total_flushes += 1
-            log(f"🚀 FLUSH OK | Saved {len(batch_list)} updates | "
+            log(f"🚀 FLUSH OK | Saved {len(payload)} updates | "
                 f"RowsBuffered={rows_buffered} | FlushCount={total_flushes}")
+
             batch_list = []
             rows_buffered = 0
             return
+
         except Exception as e:
             msg = str(e)
             log(f"⚠️ FLUSH ERROR (attempt {attempt}/3): {msg[:200]}")
+
+            # ✅ If it's grid-limit related, resize and retry immediately
+            if "exceeds grid limits" in msg.lower():
+                try:
+                    # grow by buffer so it won't hit again
+                    new_rows = max(sheet_data.row_count + 500, total_rows + 10)
+                    log(f"🧱 Auto-resize on grid limit: {sheet_data.row_count} -> {new_rows}")
+                    sheet_data.resize(rows=new_rows)
+                except Exception as ee:
+                    log(f"⚠️ Resize failed: {str(ee)[:150]}")
+
             if "429" in msg:
                 log("⏳ Quota hit, sleeping 60s...")
                 time.sleep(60)
@@ -223,6 +259,12 @@ try:
         url_c = safe_get(url_list_c, i)   # Column C
         url_d = safe_get(url_list_d, i)   # Column D
         target_row = i + 1
+
+        # ✅ Extra safety: ensure rows exist right before write
+        if target_row > sheet_data.row_count:
+            grow_to = target_row + 200
+            log(f"🧱 Growing Sheet16 for row {target_row}: {sheet_data.row_count} -> {grow_to}")
+            sheet_data.resize(rows=grow_to)
 
         log("")
         log("====================================================")
@@ -278,21 +320,16 @@ try:
             f"| Combined={len(combined_values)}")
 
         # ---------- WRITE BUFFER ----------
-        # Always write Name + Date
         batch_list.append({"range": f"A{target_row}", "values": [[name]]})
         batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
 
         if combined_values:
             batch_list.append({"range": f"K{target_row}", "values": [combined_values]})
-            log(f"📝 BUFFER APPEND | A{target_row}, J{target_row}, K{target_row}.. "
-                f"| AddedUpdates=3")
+            log(f"📝 BUFFER APPEND | A{target_row}, J{target_row}, K{target_row}.. | AddedUpdates=3")
         else:
-            log(f"📝 BUFFER APPEND | A{target_row}, J{target_row} "
-                f"| AddedUpdates=2 (no combined values)")
+            log(f"📝 BUFFER APPEND | A{target_row}, J{target_row} | AddedUpdates=2 (no combined values)")
 
         rows_buffered += 1
-
-        # show buffer state every row
         log_buffer_state(extra=f"After row {target_row}")
 
         # ---------- FLUSH WHEN FULL ----------
@@ -312,7 +349,6 @@ try:
             time.sleep(ROW_SLEEP)
 
 finally:
-    # Final flush
     flush_batch(reason="finalize")
     log_buffer_state(extra="After final flush")
 
