@@ -3,7 +3,7 @@ import os
 import time
 import json
 import random
-from datetime import date
+from datetime import date, datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -16,7 +16,8 @@ import gspread
 from webdriver_manager.chrome import ChromeDriverManager
 
 def log(msg):
-    print(msg, flush=True)
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 # ---------------- CONFIG & SHARDING ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
@@ -25,7 +26,6 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
 
-# ✅ NEW: save failed rows (does NOT change main scraping XPATH or class)
 FAILED_FILE = os.getenv("FAILED_FILE", f"failed_{SHARD_INDEX}.txt")
 _failed_seen = set()
 
@@ -39,14 +39,13 @@ def mark_failed(i, reason="NO_VALUES"):
     except:
         pass
 
-# ✅ Speed: resolve chromedriver path ONCE (restart will reuse it)
+# ✅ resolve chromedriver path ONCE
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
     opts = Options()
-
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -71,13 +70,11 @@ def create_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    driver = webdriver.Chrome(
-        service=Service(CHROME_DRIVER_PATH),
-        options=opts
-    )
+    driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     driver.set_page_load_timeout(45)
+    driver.set_script_timeout(30)
 
-    # ---- COOKIE LOGIC (FIX: include domain so cookies actually apply) ----
+    # ---- COOKIE LOGIC ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
@@ -98,43 +95,78 @@ def create_driver():
             time.sleep(1)
             log(f"✅ Cookies applied successfully ({ok}/{len(cookies)})")
         except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:120]}")
+            log(f"⚠️ Cookie error: {str(e)[:160]}")
 
     return driver
 
-# ---------------- SCRAPER LOGIC ---------------- #
-# ✅ DO NOT CHANGE: your exact XPATH + your exact class parsing kept as-is
-def scrape_tradingview(driver, url):
+# ---------------- SAFETY HELPERS (NO LOGIC CHANGE) ---------------- #
+def is_blocked_html(html_lower: str) -> bool:
+    return ("captcha" in html_lower) or ("access denied" in html_lower) or ("sign in" in html_lower)
+
+def safe_get(driver, url) -> bool:
+    """Prevents driver.get() from hanging forever."""
     try:
         driver.get(url)
+        return True
+    except TimeoutException:
+        try:
+            driver.execute_script("window.stop();")
+        except:
+            pass
+        return False
+    except WebDriverException:
+        return False
+
+# ---------------- SCRAPER LOGIC ---------------- #
+# ✅ DO NOT CHANGE: exact XPATH + exact class parsing kept as-is
+TV_XPATH = '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
+TV_CLASS = "valueValue-l31H9iuA apply-common-tooltip"
+
+def scrape_tradingview(driver, url):
+    try:
+        ok = safe_get(driver, url)
+        if not ok:
+            log("⚠️ driver.get() timeout/crash -> RESTART")
+            return "RESTART"
+
+        # ✅ fast blocked check BEFORE waiting 45s
+        html = driver.page_source.lower()
+        if is_blocked_html(html):
+            return "RESTART"
+
         WebDriverWait(driver, 45).until(
-            EC.visibility_of_element_located((
-                By.XPATH,
-                '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
-            ))
+            EC.visibility_of_element_located((By.XPATH, TV_XPATH))
         )
 
-        # ✅ Extra safety: detect common blocked pages (doesn't change selector)
+        # ✅ blocked check AFTER wait too
         html = driver.page_source.lower()
-        if "captcha" in html or "access denied" in html or "sign in" in html:
+        if is_blocked_html(html):
             return "RESTART"
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
         values = [
             el.get_text().replace('−', '-').replace('∅', 'None')
-            for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+            for el in soup.find_all("div", class_=TV_CLASS)
         ]
         return values
+
     except (TimeoutException, NoSuchElementException):
         return []
     except WebDriverException:
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
-# ✅ NEW: retries wrapper (does not change main scraping path/location)
-def scrape_with_retries(driver, url, tries=7):
+# ✅ retries wrapper (same concept, just adds deadline + logs)
+def scrape_with_retries(driver, url, tries=7, row_deadline_sec=120):
+    start = time.time()
     delay = 1.0
-    for _ in range(tries):
+
+    for attempt in range(1, tries + 1):
+        if time.time() - start > row_deadline_sec:
+            log(f"⏱️ Row deadline hit ({row_deadline_sec}s) -> giving up this row")
+            return []
+
+        log(f"   ↪ attempt {attempt}/{tries}")
         values = scrape_tradingview(driver, url)
 
         if values == "RESTART":
@@ -172,7 +204,7 @@ except Exception as e:
 driver = create_driver()
 batch_list = []
 
-BATCH_SIZE = 300
+BATCH_SIZE = 300   # NOTE: this is UPDATE REQUEST count, not row count
 current_date = date.today().strftime("%m/%d/%Y")
 ROW_SLEEP = 0.05
 
@@ -197,10 +229,17 @@ def flush_batch():
                 time.sleep(3 + attempt)
 
 try:
+    skipped = 0
+
     for i in range(last_i, len(company_list)):
 
+        # shard skip (this can look like “stuck”, so log it occasionally)
         if i % SHARD_STEP != SHARD_INDEX:
+            skipped += 1
+            if skipped % 5000 == 0:
+                log(f"…skipping due to shard ({skipped} skipped). current i={i+1}")
             continue
+        skipped = 0
 
         url = (company_list[i] or "").strip()
         name = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
@@ -214,16 +253,16 @@ try:
 
         log(f"🔍 [{i+1}/{len(company_list)}] Scraping: {name}")
 
-        # ✅ only reliability improved; XPATH/class not changed
-        values = scrape_with_retries(driver, url, tries=7)
+        values = scrape_with_retries(driver, url, tries=7, row_deadline_sec=120)
 
         if values == "RESTART":
+            log("🔄 Restarting driver...")
             try:
                 driver.quit()
             except:
                 pass
             driver = create_driver()
-            values = scrape_with_retries(driver, url, tries=5)
+            values = scrape_with_retries(driver, url, tries=5, row_deadline_sec=90)
             if values == "RESTART":
                 values = []
 
