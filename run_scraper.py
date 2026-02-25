@@ -26,6 +26,12 @@ last_i = int(open(checkpoint_file).read().strip()) if os.path.exists(checkpoint_
 
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
+# ---------------- CREATE SCREENSHOT FOLDER ---------------- #
+SCREENSHOT_DIR = "screenshots"
+if not os.path.exists(SCREENSHOT_DIR):
+    os.makedirs(SCREENSHOT_DIR)
+    log(f"📁 Created screenshot folder: {SCREENSHOT_DIR}/")
+
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
@@ -48,7 +54,7 @@ def create_driver():
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    driver.set_page_load_timeout(50)  # 🔧 INCREASED
+    driver.set_page_load_timeout(50)
 
     if os.path.exists("cookies.json"):
         try:
@@ -69,9 +75,9 @@ def create_driver():
 
     return driver
 
-# ---------------- ULTRA ROBUST SCRAPER ---------------- #
-def scrape_tradingview(driver, url, url_type=""):
-    """🔥 NEW STRATEGY: Multiple selectors + screenshots + longer waits"""
+# ---------------- H-COLUMN DEBUG SCRAPER ---------------- #
+def scrape_tradingview(driver, url, url_type="", row_num=0):
+    """Save screenshots ONLY for Col H failures to screenshots/ folder"""
     log(f"   📡 Loading {url_type}: {url[:80]}...")
     
     for attempt in range(3):
@@ -79,57 +85,51 @@ def scrape_tradingview(driver, url, url_type=""):
             driver.get(url)
             driver.set_page_load_timeout(60)
             
-            # 🔧 STRATEGY 1: Wait for ANY TradingView chart content
             WebDriverWait(driver, 60).until(
                 lambda d: any([
                     len(d.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")) > 0,
                     len(d.find_elements(By.CSS_SELECTOR, "[class*='chart']")) > 0,
-                    len(d.find_elements(By.XPATH, "//div[contains(@class, 'value')]")) > 0,
                     d.execute_script("return document.readyState") == "complete"
                 ])
             )
             
-            # 🔧 STRATEGY 2: Extra wait for data to populate
             time.sleep(5)
             
-            # 🔧 DEBUG: Save screenshot
-            try:
-                driver.save_screenshot(f"debug_{url_type}_{attempt}.png")
-                log(f"   📸 Screenshot saved: debug_{url_type}_{attempt}.png")
-            except:
-                pass
+            # 🔥 ONLY FOR COL H: Save screenshot to dedicated folder
+            if url_type.upper() == "H":
+                screenshot_path = os.path.join(SCREENSHOT_DIR, f"h_col_row_{row_num}_attempt_{attempt}.png")
+                try:
+                    driver.save_screenshot(screenshot_path)
+                    log(f"   📸 H-column screenshot: {screenshot_path}")
+                except Exception as e:
+                    log(f"   ⚠️ Screenshot failed: {str(e)[:50]}")
             
-            # 🔧 STRATEGY 3: Multiple extraction methods
             soup = BeautifulSoup(driver.page_source, "html.parser")
             
-            # Method 1: Original selector
+            # Multiple extraction methods
             values1 = [el.get_text().strip().replace('−', '-').replace('∅', 'None') 
                       for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip") 
                       if el.get_text().strip()]
             
-            # Method 2: Any valueValue class
             values2 = [el.get_text().strip().replace('−', '-').replace('∅', 'None') 
                       for el in soup.find_all("div", class_=lambda x: x and 'valueValue' in x) 
                       if el.get_text().strip()]
             
-            # Method 3: XPath fallback
             values3 = driver.find_elements(By.XPATH, "//div[contains(@class, 'value') and contains(@class, 'Value')]")
             values3_text = [el.text.strip().replace('−', '-').replace('∅', 'None') for el in values3 if el.text.strip()]
             
-            # Take best result
             values = values1 or values2 or values3_text
             
             if values:
-                log(f"   ✅ SUCCESS {url_type}: {len(values)} values (method {'1' if values1 else '2' if values2 else '3'})")
+                log(f"   ✅ SUCCESS {url_type}: {len(values)} values")
                 return values
             else:
-                log(f"   ⚠️ No values - page loaded but empty data")
+                log(f"   ⚠️ No values found (check screenshot for row {row_num})")
                 
         except Exception as e:
             log(f"   ❌ Attempt {attempt+1} failed: {str(e)[:60]}")
             time.sleep(2)
     
-    log(f"   ❌ {url_type} COMPLETELY FAILED")
     return []
 
 # ---------------- SETUP ---------------- #
@@ -190,27 +190,20 @@ def restart_driver():
     return driver
 
 def get_all_values_for_row(i):
-    """🔥 NEW: SEPARATE DRIVERS for D and H - NO CROSS-CONTAMINATION"""
-    
-    # Col D with its own driver
+    """Separate drivers + H-column screenshots"""
+    # Col D
     driver_d = ensure_driver()
     url_d = (url_d_list[i] if i < len(url_d_list) else "").strip()
     values_d = []
     if url_d.startswith("http"):
-        values_d = scrape_tradingview(driver_d, url_d, "D")
-        if values_d == []:  # Only restart on true failure
-            driver_d = restart_driver()
-            values_d = scrape_tradingview(driver_d, url_d, "D")
+        values_d = scrape_tradingview(driver_d, url_d, "D", i+1)
     
-    # 🔥 CRITICAL: NEW FRESH DRIVER for Col H
-    driver_h = create_driver()  # NEW DRIVER!
+    # 🔥 NEW FRESH DRIVER for Col H + SCREENSHOTS
+    driver_h = create_driver()
     url_h = (url_h_list[i] if i < len(url_h_list) else "").strip()
     values_h = []
     if url_h.startswith("http"):
-        values_h = scrape_tradingview(driver_h, url_h, "H")
-        if values_h == []:
-            driver_h = restart_driver()
-            values_h = scrape_tradingview(driver_h, url_h, "H")
+        values_h = scrape_tradingview(driver_h, url_h, "H", i+1)  # Pass row number for filename
     
     combined_values = []
     if isinstance(values_d, list):
@@ -218,7 +211,6 @@ def get_all_values_for_row(i):
     if isinstance(values_h, list):
         combined_values.extend(values_h)
     
-    # Cleanup H driver
     try:
         driver_h.quit()
     except:
@@ -272,4 +264,4 @@ finally:
             driver.quit()
     except:
         pass
-    log("🏁 Scraping completed successfully")
+    log("🏁 Scraping completed + screenshots in 'screenshots/' folder!")
