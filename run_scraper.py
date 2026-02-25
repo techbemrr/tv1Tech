@@ -22,19 +22,16 @@ SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
-last_i = int(open(checkpoint_file).read()) if os.path.exists(checkpoint_file) else 0
+last_i = int(open(checkpoint_file).read().strip()) if os.path.exists(checkpoint_file) else 0
 
-# ✅ Speed: resolve chromedriver path ONCE (restart will reuse it)
+# ✅ Speed: resolve chromedriver path ONCE
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
     opts = Options()
-
-    # ✅ Faster: don't wait for full page assets
     opts.page_load_strategy = "eager"
-
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -42,8 +39,6 @@ def create_driver():
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-
-    # ✅ small extra speed/consistency flags (no extractor change)
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--disable-extensions")
@@ -51,17 +46,9 @@ def create_driver():
     opts.add_argument("--disable-background-timer-throttling")
     opts.add_argument("--disable-renderer-backgrounding")
     opts.add_argument("--mute-audio")
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-
-    driver = webdriver.Chrome(
-        service=Service(CHROME_DRIVER_PATH),
-        options=opts
-    )
+    driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     driver.set_page_load_timeout(40)
 
     # ---- COOKIE LOGIC ----
@@ -71,16 +58,11 @@ def create_driver():
             time.sleep(2)
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
-
             for c in cookies:
                 try:
-                    driver.add_cookie({
-                        k: v for k, v in c.items()
-                        if k in ("name", "value", "path", "secure", "expiry")
-                    })
+                    driver.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
                 except:
                     continue
-
             driver.refresh()
             time.sleep(1)
             log("✅ Cookies applied successfully")
@@ -118,7 +100,7 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
 
-    company_list = sheet_main.col_values(1)  # Names (Col A)
+    company_list = sheet_main.col_values(1)  # Names (Col A) - 1-based
     url_d_list = sheet_main.col_values(4)    # URLs Col D
     url_h_list = sheet_main.col_values(8)    # URLs Col H
 
@@ -128,16 +110,10 @@ except Exception as e:
     sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
-driver = create_driver()
+driver = None
 batch_list = []
-
-# ✅ Faster: bigger batch = fewer API calls
-BATCH_SIZE = 10
-
-# ✅ Faster: compute date once (same run)
+BATCH_SIZE = 300
 current_date = date.today().strftime("%m/%d/%Y")
-
-# ✅ Faster: reduce sleep (or make 0)
 ROW_SLEEP = 0.05
 
 def flush_batch():
@@ -159,6 +135,22 @@ def flush_batch():
             else:
                 time.sleep(3)
 
+def ensure_driver():
+    global driver
+    if driver is None:
+        driver = create_driver()
+    return driver
+
+def restart_driver():
+    global driver
+    try:
+        if driver:
+            driver.quit()
+    except:
+        pass
+    driver = create_driver()
+    return driver
+
 def get_all_values_for_row(i):
     """Scrape both D and H URLs, return COMBINED values list"""
     combined_values = []
@@ -166,40 +158,36 @@ def get_all_values_for_row(i):
     # Col D URL
     url_d = (url_d_list[i] if i < len(url_d_list) else "").strip()
     if url_d.startswith("http"):
+        driver = ensure_driver()
         values_d = scrape_tradingview(driver, url_d)
         if values_d == "RESTART":
-            try: driver.quit()
-            except: pass
-            driver = create_driver()
+            driver = restart_driver()
             values_d = scrape_tradingview(driver, url_d) or []
         if isinstance(values_d, list):
             combined_values.extend(values_d)
-        log(f"✅ Col D: {len(values_d if isinstance(values_d, list) else 0)} values")
+        log(f"✅ Col D: {len(values_d) if isinstance(values_d, list) else 0} values")
     
     # Col H URL  
     url_h = (url_h_list[i] if i < len(url_h_list) else "").strip()
     if url_h.startswith("http"):
+        driver = ensure_driver()
         values_h = scrape_tradingview(driver, url_h)
         if values_h == "RESTART":
-            try: driver.quit()
-            except: pass
-            driver = create_driver()
+            driver = restart_driver()
             values_h = scrape_tradingview(driver, url_h) or []
         if isinstance(values_h, list):
             combined_values.extend(values_h)
-        log(f"✅ Col H: {len(values_h if isinstance(values_h, list) else 0)} values")
+        log(f"✅ Col H: {len(values_h) if isinstance(values_h, list) else 0} values")
     
     return combined_values
 
 try:
-    # ✅ Run till END (removed fixed 2500 break)
     for i in range(last_i, len(company_list)):
-
-        # ✅ Keep your sharding (only skips rows that belong to OTHER shards)
+        # ✅ Keep sharding
         if i % SHARD_STEP != SHARD_INDEX:
             continue
 
-        name = (company_list[i] or f"Row {i+1}").strip()
+        name = (company_list[i] if i < len(company_list) else f"Row {i+1}").strip()
 
         # Skip if BOTH URLs invalid/blank
         url_d = (url_d_list[i] if i < len(url_d_list) else "").strip()
@@ -212,19 +200,17 @@ try:
 
         log(f"🔍 [{i+1}/{len(company_list)}] Scraping: {name} (D+H)")
 
-        # Get COMBINED values from both URLs
+        # Get COMBINED values - FIXED driver handling
         combined_values = get_all_values_for_row(i)
 
         target_row = i + 1
 
         if combined_values:
-            # ✅ Write A, J, K with COMBINED values
             batch_list.append({"range": f"A{target_row}", "values": [[name]]})
             batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
             batch_list.append({"range": f"K{target_row}", "values": [combined_values]})
             log(f"✅ COMBINED: {len(combined_values)} values | Buffered: {len(batch_list)}/{BATCH_SIZE}")
         else:
-            # Still write name/date even if no values
             batch_list.append({"range": f"A{target_row}", "values": [[name]]})
             batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
             log(f"⚠️ No combined values for {name} (A/J updated only)")
@@ -241,7 +227,8 @@ try:
 finally:
     flush_batch()
     try:
-        driver.quit()
+        if driver:
+            driver.quit()
     except:
         pass
     log("🏁 Scraping completed successfully")
