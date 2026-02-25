@@ -257,4 +257,3 @@ finally:
         pass
     log("🏁 Scraping completed successfully")
     log(f"📌 Failed rows file: {FAILED_FILE}")
-    
