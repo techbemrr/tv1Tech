@@ -63,15 +63,15 @@ def create_driver():
         options=opts
     )
 
-    # ✅ Important: keep hard timeouts so it doesn't "hang forever"
-    driver.set_page_load_timeout(25)
-    driver.set_script_timeout(25)
+    # ✅ Faster: tighter timeouts (biggest speed gain when a page is slow/bad)
+    driver.set_page_load_timeout(12)
+    driver.set_script_timeout(12)
 
     # ---- COOKIE LOGIC ----
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
-            time.sleep(2)
+            time.sleep(1)
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
 
@@ -85,7 +85,7 @@ def create_driver():
                     continue
 
             driver.refresh()
-            time.sleep(1)
+            time.sleep(0.5)
             log("✅ Cookies applied successfully")
         except Exception as e:
             log(f"⚠️ Cookie error: {str(e)[:120]}")
@@ -93,40 +93,38 @@ def create_driver():
     return driver
 
 # ---------------- STUCK-SAFE NAVIGATION ---------------- #
-def safe_get(driver, url, tries=2):
+def safe_get(driver, url):
     """
-    Minimal addition to prevent "stuck" on driver.get():
-    - catch page-load timeout
-    - stop loading
-    - retry once
+    Speed-focused:
+    - single try only (no double waits)
+    - stop loading on timeout
     """
-    for t in range(tries):
+    try:
+        driver.get(url)
+        return True
+    except TimeoutException:
+        log("⏱️ Page load timeout -> window.stop()")
         try:
-            driver.get(url)
-            return True
-        except TimeoutException:
-            log(f"⏱️ Page load timeout (try {t+1}/{tries}) -> window.stop()")
-            try:
-                driver.execute_script("window.stop();")
-            except:
-                pass
-            time.sleep(0.5)
-        except WebDriverException as e:
-            log(f"🛑 WebDriver error on get: {str(e)[:120]}")
-            return "RESTART"
-    return False
+            driver.execute_script("window.stop();")
+        except:
+            pass
+        return False
+    except WebDriverException as e:
+        log(f"🛑 WebDriver error on get: {str(e)[:120]}")
+        return "RESTART"
 
 # ---------------- SCRAPER LOGIC ---------------- #
-# ❌ main extractor unchanged (same XPATH/class), only navigation made safe
+# XPATH + class unchanged. Only reduced wait time.
 def scrape_tradingview(driver, url):
     try:
-        ok = safe_get(driver, url, tries=2)
+        ok = safe_get(driver, url)
         if ok == "RESTART":
             return "RESTART"
         if ok is False:
             return []
 
-        WebDriverWait(driver, 35).until(
+        # ✅ Faster: reduced wait (main slowdown was waiting 35s)
+        WebDriverWait(driver, 18).until(
             EC.visibility_of_element_located((
                 By.XPATH,
                 '/html/body/div[2]/div/div[5]/div/div[1]/div/div[2]/div[1]/div[2]/div/div[1]/div[2]/div[2]/div[2]/div[2]/div'
@@ -146,23 +144,15 @@ def scrape_tradingview(driver, url):
         log("🛑 Browser Crash Detected")
         return "RESTART"
 
-# ---------------- SINGLE-URL RETRY/RECOVERY (minimal) ---------------- #
+# ---------------- SINGLE-URL RECOVERY (speed version) ---------------- #
 def scrape_with_recovery(driver, url):
     """
-    Same behavior as your earlier retry/restart, but wrapped so D and H both use it.
+    Speed-focused changes:
+    - NO refresh retry (refresh + sleep was costly)
+    - restart only if driver crashes
     """
     values = scrape_tradingview(driver, url)
 
-    # retry once if empty
-    if values == []:
-        try:
-            driver.refresh()
-            time.sleep(0.7)
-        except:
-            pass
-        values = scrape_tradingview(driver, url)
-
-    # restart browser if crashed / stuck driver
     if values == "RESTART":
         try:
             driver.quit()
@@ -197,7 +187,9 @@ batch_list = []
 
 BATCH_SIZE = 300
 current_date = date.today().strftime("%m/%d/%Y")
-ROW_SLEEP = 0.05
+
+# ✅ Faster: remove row sleep (was adding time)
+ROW_SLEEP = 0
 
 def flush_batch():
     global batch_list
@@ -216,7 +208,7 @@ def flush_batch():
                 log("⏳ Quota hit, sleeping 60s...")
                 time.sleep(60)
             else:
-                time.sleep(3)
+                time.sleep(2)
 
 try:
     for i in range(last_i, len(company_list)):
@@ -228,11 +220,16 @@ try:
         url_h = (url_h_list[i] if i < len(url_h_list) else "").strip()
         name  = (name_list[i] if i < len(name_list) else f"Row {i+1}").strip()
 
+        # ✅ If both invalid, skip
         if (not url_d.startswith("http")) and (not url_h.startswith("http")):
             log(f"⏭️ Row {i+1}: invalid/blank URLs in D & H -> skipped")
             with open(checkpoint_file, "w") as f:
                 f.write(str(i + 1))
             continue
+
+        # ✅ If H is same as D, don't waste a 2nd visit
+        if url_h and url_d and url_h == url_d:
+            url_h = ""
 
         log(f"🔍 [{i+1}/{len(company_list)}] Scraping: {name}")
 
