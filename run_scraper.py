@@ -30,7 +30,9 @@ CHROME_DRIVER_PATH = ChromeDriverManager().install()
 def create_driver():
     log("🌐 Initializing Hardened Chrome Instance...")
     opts = Options()
-    opts.page_load_strategy = "eager"
+    # Changed from 'eager' to 'normal' to ensure JS components have time to initialize
+    opts.page_load_strategy = "normal"
+    
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -40,18 +42,17 @@ def create_driver():
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
-    opts.add_argument("--disable-extensions")
     opts.add_argument("--mute-audio")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    driver.set_page_load_timeout(15)
-    driver.set_script_timeout(15)
+    driver.set_page_load_timeout(25) # Increased timeout for stability
+    driver.set_script_timeout(25)
 
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
-            time.sleep(1)
+            time.sleep(2)
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
             for c in cookies:
@@ -59,7 +60,7 @@ def create_driver():
                     driver.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
                 except: continue
             driver.refresh()
-            time.sleep(0.5)
+            time.sleep(1)
             log("✅ Cookies applied successfully")
         except Exception as e:
             log(f"⚠️ Cookie error: {str(e)[:120]}")
@@ -68,6 +69,8 @@ def create_driver():
 def safe_get(driver, url):
     try:
         driver.get(url)
+        # Force a small wait for the dynamic JS content to settle
+        time.sleep(2) 
         return True
     except TimeoutException:
         try: driver.execute_script("window.stop();")
@@ -83,18 +86,19 @@ def scrape_tradingview(driver, url):
         if ok == "RESTART": return "RESTART"
         if not ok: return []
 
-        # Wait specifically for the technical values to load
+        # Wait for the specific value containers to be present
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CLASS_NAME, "valueValue-l31H9iuA"))
         )
         
-        # Small sleep to ensure the numbers inside the containers are populated
-        time.sleep(1)
+        # Final safety sleep to ensure all numbers populate
+        time.sleep(1.5)
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
+        # Target the specific value class
         values = [
             el.get_text().replace('−', '-').replace('∅', 'None').strip()
-            for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+            for el in soup.find_all("div", class_="valueValue-l31H9iuA")
         ]
         return values
     except (TimeoutException, NoSuchElementException):
@@ -131,7 +135,7 @@ except Exception as e:
 # ---------------- MAIN LOOP ---------------- #
 driver = create_driver()
 batch_list = []
-BATCH_SIZE = 10
+BATCH_SIZE = 5 # Reduced batch size for more frequent saves
 current_date = date.today().strftime("%m/%d/%Y")
 
 def flush_batch():
@@ -140,7 +144,7 @@ def flush_batch():
     for attempt in range(3):
         try:
             sheet_data.batch_update(batch_list)
-            log(f"🚀 Saved {len(batch_list) // 3} rows to Google Sheets")
+            log(f"🚀 Saved updates to Sheet")
             batch_list = []
             return
         except Exception as e:
@@ -163,11 +167,10 @@ try:
             with open(checkpoint_file, "w") as f: f.write(str(i + 1))
             continue
 
-        # Prevent double-scraping if URLs are identical
         if url_h and url_d and url_h == url_d:
             url_h = ""
 
-        log(f"🔍 [{i+1}/{len(company_list)}] Processing: {name}")
+        log(f"🔍 [{i+1}/{len(company_list)}] {name}")
         
         row_values = []
         
@@ -176,7 +179,7 @@ try:
             driver, vals_d = scrape_with_recovery(driver, url_d)
             if isinstance(vals_d, list) and vals_d:
                 row_values.extend(vals_d)
-                log(f"   📊 Link D: {len(vals_d)} values found")
+                log(f"   📊 Link D: {len(vals_d)} values")
             else:
                 log(f"   ⚠️ Link D: No values found")
 
@@ -185,21 +188,19 @@ try:
             driver, vals_h = scrape_with_recovery(driver, url_h)
             if isinstance(vals_h, list) and vals_h:
                 row_values.extend(vals_h)
-                log(f"   📊 Link H: {len(vals_h)} values found (Total: {len(row_values)})")
+                log(f"   📊 Link H: {len(vals_h)} values")
             else:
                 log(f"   ⚠️ Link H: No values found")
 
         target_row = i + 1
         
-        # Prepare Batch Update
         batch_list.append({"range": f"A{target_row}", "values": [[name]]})
         batch_list.append({"range": f"J{target_row}", "values": [[current_date]]})
         
         if row_values:
-            # Writes D values followed immediately by H values starting at Column K
             batch_list.append({"range": f"K{target_row}", "values": [row_values]})
         
-        if len(batch_list) >= (BATCH_SIZE * 3): # 3 updates per row
+        if len(batch_list) >= (BATCH_SIZE * 3):
             flush_batch()
 
         with open(checkpoint_file, "w") as f: f.write(str(i + 1))
