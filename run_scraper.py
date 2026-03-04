@@ -61,38 +61,33 @@ def create_driver():
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
-    log(f"🔗 {url_type}-URL: {url}")
     for attempt in range(3):
         try:
             driver.get(url)
             try:
-                # Wait up to 50 seconds for the UI to exist
                 WebDriverWait(driver, 50).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
             except TimeoutException:
                 pass
-
-            # Extra 12s for JavaScript rendering - ensures values are fully loaded
             time.sleep(12) 
-            
             soup = BeautifulSoup(driver.page_source, "html.parser")
             v1 = [el.get_text().strip() for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")]
             v2 = [el.get_text().strip() for el in soup.find_all("div", class_=lambda x: x and 'valueValue' in x)]
             v3 = [el.text.strip() for el in driver.find_elements(By.XPATH, "//div[contains(@class, 'value') and contains(@class, 'Value')]")]
-            
             raw_values = v1 or v2 or v3
             final_values = [str(v) for v in raw_values if v is not None]
-            
             if final_values:
-                log(f"    ✅ SUCCESS {url_type}: {len(final_values)} values found.")
                 return final_values
             else:
-                log(f"    ⚠️ No values. Refreshing (Attempt {attempt+1}/3)...")
-                driver.refresh()
-                time.sleep(5)
-        except Exception as e:
-            log(f"    ❌ Error: {str(e)[:50]}")
+                driver.refresh(); time.sleep(5)
+        except Exception:
             time.sleep(3)
     return []
+
+# ---------------- ANTI-COLLISION STARTUP ---------------- #
+# This wait prevents all 25 workers from hitting the Google Read API at once
+startup_wait = random.uniform(2, 45)
+log(f"⏳ Startup Jitter: Waiting {startup_wait:.1f}s before reading Sheet...")
+time.sleep(startup_wait)
 
 # ---------------- SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
@@ -100,38 +95,44 @@ try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
-    company_list = sheet_main.col_values(1)
-    url_d_list = sheet_main.col_values(4)
-    url_h_list = sheet_main.col_values(8)
+    
+    # Read columns with retries
+    company_list = []
+    for attempt in range(3):
+        try:
+            company_list = sheet_main.col_values(1)
+            url_d_list = sheet_main.col_values(4)
+            url_h_list = sheet_main.col_values(8)
+            break
+        except Exception as e:
+            log(f"⚠️ Initial Read Error: {e}. Retrying...")
+            time.sleep(10)
+            
 except Exception as e:
     log(f"❌ Connection Error: {e}"); sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
 driver = None
 batch_list = []
-BATCH_SIZE = 100 # 300 updates per flush (100 rows * 3 columns)
+BATCH_SIZE = 100 
 current_date = date.today().strftime("%m/%d/%Y")
 
 def flush_batch():
     global batch_list
     if not batch_list: return
-    
-    # Randomized sleep prevents all 25 workers from hitting Sheets at once
     jitter = random.uniform(2, 12)
-    log(f"⏳ Buffer full. Waiting {jitter:.1f}s jitter before save...")
+    log(f"🚀 Buffer reached capacity. Jitter {jitter:.1f}s then saving to Sheets...")
     time.sleep(jitter) 
-    
     for attempt in range(5):
         try:
-            # value_input_option='RAW' preserves text as is
             sheet_data.batch_update(batch_list, value_input_option='RAW')
-            log(f"🚀 [Shard {SHARD_INDEX}] Successfully saved {len(batch_list)} updates.")
+            log(f"✅ [Shard {SHARD_INDEX}] SUCCESS: Batch of {len(batch_list)//3} rows saved.")
             batch_list = []
             return
         except Exception as e:
             msg = str(e)
             wait = 60 if "429" in msg else 10
-            log(f"⚠️ Sheets API Error. Retrying in {wait}s...")
+            log(f"⚠️ API Error. Retrying in {wait}s...")
             time.sleep(wait + random.uniform(1, 5))
 
 def ensure_driver():
@@ -144,8 +145,6 @@ try:
         if i % SHARD_STEP != SHARD_INDEX: continue
 
         name = company_list[i].strip()
-        log(f"🔍 [Row {i+1}] Scraping: {name}")
-
         active_driver = ensure_driver()
         
         u_d = url_d_list[i] if i < len(url_d_list) and url_d_list[i].startswith("http") else None
@@ -156,22 +155,3 @@ try:
         combined = vals_d + vals_h
 
         row_idx = i + 1
-        batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
-        batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
-        if combined:
-            batch_list.append({"range": f"K{row_idx}", "values": [combined]})
-        
-        # Flush every 100 rows (300 cells)
-        if len(batch_list) >= (BATCH_SIZE * 3):
-            flush_batch()
-
-        # Update checkpoint
-        with open(checkpoint_file, "w") as f:
-            f.write(str(i + 1))
-
-        time.sleep(1.5)
-
-finally:
-    flush_batch()
-    if driver: driver.quit()
-    log("🏁 Shard Completed.")
