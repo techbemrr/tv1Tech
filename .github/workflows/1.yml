@@ -18,7 +18,7 @@ jobs:
         shard: [0,1,2,3,4]
 
     env:
-      SHARD_STEP: 20
+      SHARD_STEP: 25
 
     steps:
       - uses: actions/checkout@v4
