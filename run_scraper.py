@@ -84,7 +84,6 @@ def scrape_tradingview(driver, url, url_type=""):
     return []
 
 # ---------------- ANTI-COLLISION STARTUP ---------------- #
-# This wait prevents all 25 workers from hitting the Google Read API at once
 startup_wait = random.uniform(2, 45)
 log(f"⏳ Startup Jitter: Waiting {startup_wait:.1f}s before reading Sheet...")
 time.sleep(startup_wait)
@@ -96,17 +95,20 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
     
-    # Read columns with retries
     company_list = []
+    url_d_list = []
+    url_h_list = []
+    
     for attempt in range(3):
         try:
             company_list = sheet_main.col_values(1)
             url_d_list = sheet_main.col_values(4)
             url_h_list = sheet_main.col_values(8)
+            log("✅ Initial Read Successful.")
             break
         except Exception as e:
-            log(f"⚠️ Initial Read Error: {e}. Retrying...")
-            time.sleep(10)
+            log(f"⚠️ Read Attempt {attempt+1} failed. Retrying...")
+            time.sleep(15)
             
 except Exception as e:
     log(f"❌ Connection Error: {e}"); sys.exit(1)
@@ -121,18 +123,18 @@ def flush_batch():
     global batch_list
     if not batch_list: return
     jitter = random.uniform(2, 12)
-    log(f"🚀 Buffer reached capacity. Jitter {jitter:.1f}s then saving to Sheets...")
+    log(f"🚀 Buffer full. Jitter {jitter:.1f}s then saving...")
     time.sleep(jitter) 
     for attempt in range(5):
         try:
             sheet_data.batch_update(batch_list, value_input_option='RAW')
-            log(f"✅ [Shard {SHARD_INDEX}] SUCCESS: Batch of {len(batch_list)//3} rows saved.")
+            log(f"✅ [Shard {SHARD_INDEX}] Batch Save Success.")
             batch_list = []
             return
         except Exception as e:
             msg = str(e)
             wait = 60 if "429" in msg else 10
-            log(f"⚠️ API Error. Retrying in {wait}s...")
+            log(f"⚠️ Sheets API Error. Retrying in {wait}s...")
             time.sleep(wait + random.uniform(1, 5))
 
 def ensure_driver():
@@ -155,3 +157,29 @@ try:
         combined = vals_d + vals_h
 
         row_idx = i + 1
+        batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
+        batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
+        if combined:
+            batch_list.append({"range": f"K{row_idx}", "values": [combined]})
+        
+        # Tracking Log
+        current_rows = len(batch_list) // 3
+        log(f"🔍 [Row {row_idx}] {name} | Buffer: {current_rows}/{BATCH_SIZE}")
+
+        if len(batch_list) >= (BATCH_SIZE * 3):
+            flush_batch()
+
+        with open(checkpoint_file, "w") as f:
+            f.write(str(i + 1))
+        time.sleep(1.5)
+
+except Exception as e:
+    log(f"❌ Critical Loop Error: {e}")
+
+finally:
+    if batch_list:
+        log("📦 Finalizing remaining buffer...")
+        flush_batch()
+    if driver: 
+        driver.quit()
+    log("🏁 Shard Completed.")
