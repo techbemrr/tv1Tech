@@ -81,11 +81,11 @@ def scrape_tradingview(driver, url, url_type="", row_num=0):
             
             # Wait for any element with 'valueValue' to appear (even if empty/skeleton)
             try:
-                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
+                WebDriverWait(driver, 40).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
             except TimeoutException:
                 log(f"    ⏳ CSS locator not found yet, waiting...")
 
-            time.sleep(6) # Give JS extra time to populate the actual text
+            time.sleep(10) # Give JS extra time to populate the actual text
             
             soup = BeautifulSoup(driver.page_source, "html.parser")
             
@@ -139,7 +139,7 @@ driver = None
 batch_list = []
 BATCH_SIZE = 100 
 current_date = date.today().strftime("%m/%d/%Y")
-ROW_SLEEP = 0.2
+ROW_SLEEP = 1
 
 def flush_batch():
     global batch_list
