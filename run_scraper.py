@@ -56,36 +56,49 @@ def create_driver():
                 except: continue
             driver.refresh()
             time.sleep(3)
-        except: pass
+            log("✅ Cookies applied.")
+        except: 
+            log("⚠️ Cookie error (ignored).")
     return driver
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
+    log(f"   📡 Shard {SHARD_INDEX} | {url_type} | Navigating to: {url}")
     for attempt in range(3):
         try:
             driver.get(url)
             try:
                 WebDriverWait(driver, 50).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
             except TimeoutException:
-                pass
-            time.sleep(12) 
+                log(f"   ⏳ Timed out waiting for UI elements on {url_type}, attempting scrape anyway...")
+
+            time.sleep(12) # JS Render Wait
+            
             soup = BeautifulSoup(driver.page_source, "html.parser")
             v1 = [el.get_text().strip() for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")]
             v2 = [el.get_text().strip() for el in soup.find_all("div", class_=lambda x: x and 'valueValue' in x)]
             v3 = [el.text.strip() for el in driver.find_elements(By.XPATH, "//div[contains(@class, 'value') and contains(@class, 'Value')]")]
+            
             raw_values = v1 or v2 or v3
             final_values = [str(v) for v in raw_values if v is not None]
+            
             if final_values:
+                # Log a preview of the values found
+                preview = ", ".join(final_values[:5]) + ("..." if len(final_values) > 5 else "")
+                log(f"   ✅ {url_type} SUCCESS: Captured {len(final_values)} values: [{preview}]")
                 return final_values
             else:
-                driver.refresh(); time.sleep(5)
-        except Exception:
+                log(f"   ⚠️ {url_type} EMPTY: No values found. Attempt {attempt+1}/3. Refreshing...")
+                driver.refresh()
+                time.sleep(5)
+        except Exception as e:
+            log(f"   ❌ {url_type} ERROR: {str(e)[:100]}")
             time.sleep(3)
     return []
 
 # ---------------- ANTI-COLLISION STARTUP ---------------- #
 startup_wait = random.uniform(2, 45)
-log(f"⏳ Startup Jitter: Waiting {startup_wait:.1f}s before reading Sheet...")
+log(f"⏳ Anti-collision: Shard {SHARD_INDEX} staggered start. Waiting {startup_wait:.1f}s...")
 time.sleep(startup_wait)
 
 # ---------------- SETUP ---------------- #
@@ -95,19 +108,16 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
     
-    company_list = []
-    url_d_list = []
-    url_h_list = []
-    
+    company_list, url_d_list, url_h_list = [], [], []
     for attempt in range(3):
         try:
             company_list = sheet_main.col_values(1)
             url_d_list = sheet_main.col_values(4)
             url_h_list = sheet_main.col_values(8)
-            log("✅ Initial Read Successful.")
+            log(f"✅ Sheet Ready: {len(company_list)} tickers loaded.")
             break
         except Exception as e:
-            log(f"⚠️ Read Attempt {attempt+1} failed. Retrying...")
+            log(f"⚠️ Read Error: {e}. Retrying...")
             time.sleep(15)
             
 except Exception as e:
@@ -123,18 +133,18 @@ def flush_batch():
     global batch_list
     if not batch_list: return
     jitter = random.uniform(2, 12)
-    log(f"🚀 Buffer full. Jitter {jitter:.1f}s then saving...")
+    log(f"🚀 [Shard {SHARD_INDEX}] BUFFER FULL ({len(batch_list)//3}/{BATCH_SIZE} rows). Waiting {jitter:.1f}s jitter...")
     time.sleep(jitter) 
     for attempt in range(5):
         try:
             sheet_data.batch_update(batch_list, value_input_option='RAW')
-            log(f"✅ [Shard {SHARD_INDEX}] Batch Save Success.")
+            log(f"✅ [Shard {SHARD_INDEX}] SUCCESS: Google Sheets updated.")
             batch_list = []
             return
         except Exception as e:
             msg = str(e)
             wait = 60 if "429" in msg else 10
-            log(f"⚠️ Sheets API Error. Retrying in {wait}s...")
+            log(f"⚠️ Sheets API Busy. Retrying in {wait}s...")
             time.sleep(wait + random.uniform(1, 5))
 
 def ensure_driver():
@@ -147,13 +157,15 @@ try:
         if i % SHARD_STEP != SHARD_INDEX: continue
 
         name = company_list[i].strip()
+        log(f"--- [ROW {i+1}] Processing: {name} ---")
+
         active_driver = ensure_driver()
         
         u_d = url_d_list[i] if i < len(url_d_list) and url_d_list[i].startswith("http") else None
         u_h = url_h_list[i] if i < len(url_h_list) and url_h_list[i].startswith("http") else None
         
-        vals_d = scrape_tradingview(active_driver, u_d, "D") if u_d else []
-        vals_h = scrape_tradingview(active_driver, u_h, "H") if u_h else []
+        vals_d = scrape_tradingview(active_driver, u_d, "DAILY") if u_d else []
+        vals_h = scrape_tradingview(active_driver, u_h, "HOURLY") if u_h else []
         combined = vals_d + vals_h
 
         row_idx = i + 1
@@ -161,25 +173,26 @@ try:
         batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
         if combined:
             batch_list.append({"range": f"K{row_idx}", "values": [combined]})
+            log(f"   📦 Added to Buffer: {len(combined)} values total.")
         
-        # Tracking Log
-        current_rows = len(batch_list) // 3
-        log(f"🔍 [Row {row_idx}] {name} | Buffer: {current_rows}/{BATCH_SIZE}")
+        # Immediate buffer progress log
+        log(f"📊 SHARD {SHARD_INDEX} PROGRESS: {len(batch_list)//3}/{BATCH_SIZE} rows in memory.")
 
         if len(batch_list) >= (BATCH_SIZE * 3):
             flush_batch()
 
         with open(checkpoint_file, "w") as f:
             f.write(str(i + 1))
+        
         time.sleep(1.5)
 
 except Exception as e:
-    log(f"❌ Critical Loop Error: {e}")
+    log(f"❌ CRITICAL ERROR: {e}")
 
 finally:
     if batch_list:
-        log("📦 Finalizing remaining buffer...")
+        log("📦 FINAL FLUSH: Saving remaining items before exit...")
         flush_batch()
     if driver: 
         driver.quit()
-    log("🏁 Shard Completed.")
+    log(f"🏁 SHARD {SHARD_INDEX} FINISHED.")
