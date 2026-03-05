@@ -33,7 +33,7 @@ CHROME_DRIVER_PATH = ChromeDriverManager().install()
 def create_driver():
     log(f"🌐 [Shard {SHARD_INDEX}] Range {START_ROW+1}-{END_ROW} | Initializing...")
     opts = Options()
-    opts.page_load_strategy = "normal" # Changed back to normal for accuracy
+    opts.page_load_strategy = "normal" 
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -60,20 +60,18 @@ def create_driver():
         except: pass
     return driver
 
-# ---------------- ACCURATE SCRAPER ---------------- #
+# ---------------- SCRAPER ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
     log(f"   📡 Navigating {url_type}...")
     try:
         driver.get(url)
-        # Reduced initial wait to 12s (was 20s), then we poll
-        time.sleep(12)
+        time.sleep(12) # Accuracy wait
         
         final_values = []
-        for check in range(5): # Polling for another 10s if needed
+        for check in range(5): 
             soup = BeautifulSoup(driver.page_source, "html.parser")
             v1 = [el.get_text().strip() for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")]
             v2 = [el.get_text().strip() for el in soup.find_all("div", class_=lambda x: x and 'valueValue' in x)]
-            # Restored XPath for maximum accuracy
             v3 = [el.text.strip() for el in driver.find_elements(By.XPATH, "//div[contains(@class, 'value') and contains(@class, 'Value')]")]
             
             raw_values = v1 or v2 or v3
@@ -83,7 +81,6 @@ def scrape_tradingview(driver, url, url_type=""):
                 log(f"   📊 Found {len(final_values)} values.")
                 return final_values
             
-            # If not found, scroll and wait 2 more seconds
             driver.execute_script("window.scrollTo(0, 400);")
             time.sleep(2)
             
@@ -105,10 +102,11 @@ except Exception as e:
 
 driver = create_driver()
 batch_list = []
-BATCH_SIZE = 300 
+BATCH_SIZE = 300 # Updated batch size
 current_date = date.today().strftime("%m/%d/%Y")
 
 try:
+    # Process the range (e.g. 0 to 500)
     for i in range(last_i, min(END_ROW, len(company_list))):
         name = company_list[i].strip()
         log(f"--- [ROW {i+1}] {name} ---")
@@ -126,16 +124,22 @@ try:
         if combined:
             batch_list.append({"range": f"K{row_idx}", "values": [combined]})
         
+        # Check if batch of 300 rows (900 list items) is full
         if len(batch_list) // 3 >= BATCH_SIZE:
+            log(f"🚀 Batch threshold {BATCH_SIZE} reached. Saving to sheet...")
             sheet_data.batch_update(batch_list, value_input_option='RAW')
-            log(f"🚀 BATCH SAVED.")
             batch_list = []
 
         with open(checkpoint_file, "w") as f:
             f.write(str(i + 1))
         time.sleep(1)
+
 finally:
+    # IMPORTANT: This block handles the remaining 200 symbols if shard ends at 500
     if batch_list:
+        log(f"📤 Final Flush: Uploading remaining {len(batch_list)//3} symbols...")
         sheet_data.batch_update(batch_list, value_input_option='RAW')
-    if driver: driver.quit()
+    
+    if driver: 
+        driver.quit()
     log("🏁 Shard Completed.")
