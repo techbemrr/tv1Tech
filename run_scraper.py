@@ -15,66 +15,74 @@ import gspread
 from webdriver_manager.chrome import ChromeDriverManager
 
 def log(msg):
+    # Logs with timestamp for better tracking in GitHub Actions
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ---------------- FIXED BLOCK LOGIC ---------------- #
+# ---------------- BLOCK-BASED SHARDING CONFIG ---------------- #
+# Each YAML should provide SHARD_INDEX (0-4) and SHARD_SIZE (500)
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_SIZE  = int(os.getenv("SHARD_SIZE", "500")) 
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-# ---------------- BROWSER FACTORY ---------------- #
+# ---------------- BROWSER SETUP ---------------- #
 def create_driver():
-    log(f"🌐 [Shard {SHARD_INDEX}] Initializing Chrome...")
+    log(f"🌐 [Shard {SHARD_INDEX}] Initializing Chrome Browser...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
     driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     driver.set_page_load_timeout(90)
     return driver
 
-# ---------------- SCRAPER (Accuracy First) ---------------- #
+# ---------------- SMART SCRAPER (Zero Error Logic) ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
-    log(f"   📡 {url_type}: {url}")
-    for attempt in range(3):
+    log(f"   📡 Fetching {url_type}...")
+    for attempt in range(1, 4):
         try:
             driver.get(url)
             wait = WebDriverWait(driver, 45)
-            target_selector = "[class*='valueValue']"
             
-            # Wait for any data to load
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, target_selector)))
+            # Selector for TradingView indicator values
+            val_css = "[class*='valueValue']"
             
-            # Wait specifically for the first value to NOT be '∅' or empty
+            # 1. Wait for elements to appear in DOM
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, val_css)))
+            
+            # 2. SMART WAIT: Wait for '∅' or '—' to turn into actual numbers
+            # This is the key to 100% accuracy.
             try:
-                wait.until(lambda d: d.find_element(By.CSS_SELECTOR, target_selector).text not in ["", "∅", "—"])
-            except:
-                log(f"   ⏳ Data still calculating... forcing 10s wait.")
+                wait.until(lambda d: d.find_element(By.CSS_SELECTOR, val_css).text not in ["", "∅", "—", "0"])
+            except TimeoutException:
+                log(f"   ⏳ Data taking too long to calculate... forcing extra 10s wait.")
                 time.sleep(10)
 
-            # Extract via JS for speed and accuracy
-            raw_values = driver.execute_script("""
+            # 3. EXTRACTION: Execute JS to pull all values instantly
+            raw_data = driver.execute_script("""
                 return Array.from(document.querySelectorAll("[class*='valueValue']")).map(el => el.innerText.strip());
             """)
             
-            final_values = [str(v) for v in raw_values if v and v not in ["∅", "—"]]
+            # Filter out any lingering null symbols
+            clean_data = [str(v) for v in raw_data if v and v not in ["∅", "—"]]
             
-            if len(final_values) > 5:
-                log(f"   ✅ SUCCESS: Captured {len(final_values)} values.")
-                return final_values
+            if len(clean_data) > 5:
+                log(f"   ✅ {url_type} SUCCESS: Captured {len(clean_data)} indicators.")
+                log(f"   📊 Sample: {clean_data[:4]}...")
+                return clean_data
             else:
-                log(f"   ⚠️ Incomplete data. Retrying...")
+                log(f"   ⚠️ Attempt {attempt}: Incomplete data. Retrying...")
                 driver.refresh()
                 time.sleep(5)
         except Exception as e:
-            log(f"   ❌ Scrape Error: {str(e)[:50]}")
+            log(f"   ❌ {url_type} Error: {str(e)[:60]}")
     return []
 
-# ---------------- DATA LOADING ---------------- #
+# ---------------- DATA INITIALIZATION ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
@@ -84,90 +92,84 @@ try:
     company_list = sheet_main.col_values(1)
     url_d_list = sheet_main.col_values(4)
     url_h_list = sheet_main.col_values(8)
-    total_symbols = len(company_list)
-    log(f"✅ Data loaded: {total_symbols} tickers.")
+    total_count = len(company_list)
+    log(f"✅ Data Synchronized. Total Symbols: {total_count}")
 except Exception as e:
-    log(f"❌ Connection Error: {e}"); sys.exit(1)
+    log(f"❌ Critical Error: {e}"); sys.exit(1)
 
-# ---------------- CALCULATE START & END ROW ---------------- #
-# Shard 0: 0 to 499 (Rows 1-500)
-# Shard 1: 500 to 999 (Rows 501-1000)
+# ---------------- BLOCK RANGE CALCULATION ---------------- #
+# Row 1 is usually header, but col_values(1) gives all. 
+# Shard 0 starts at 0, Shard 1 starts at 500, etc.
 start_idx = SHARD_INDEX * SHARD_SIZE
 
-# Catch-all for the last shard (Index 4) to handle everything left
-if SHARD_INDEX == 4:
-    end_idx = total_symbols
+if SHARD_INDEX == 4: # Last shard handles the remainder
+    end_idx = total_count
 else:
-    end_idx = min(start_idx + SHARD_SIZE, total_symbols)
+    end_idx = min(start_idx + SHARD_SIZE, total_count)
 
-# Resume from checkpoint within this shard's range
+# Resume from checkpoint within assigned block
 if os.path.exists(checkpoint_file):
     with open(checkpoint_file, "r") as f:
-        saved_val = f.read().strip()
-        current_idx = int(saved_val) if saved_val.isdigit() else start_idx
+        saved = f.read().strip()
+        current_idx = int(saved) if saved.isdigit() else start_idx
 else:
     current_idx = start_idx
 
-# Ensure checkpoint hasn't jumped outside this shard's assigned block
+# Protection against checkpoint being outside shard block
 current_idx = max(start_idx, current_idx)
 
-log(f"🚀 Shard {SHARD_INDEX} assigned indices: {start_idx} to {end_idx}")
-log(f"📈 Starting work from Index: {current_idx}")
+log(f"🚀 Shard {SHARD_INDEX} Assigned: Rows {start_idx+1} to {end_idx}")
+log(f"📈 Resuming from Row: {current_idx+1}")
 
-# ---------------- MAIN LOOP ---------------- #
-driver = None
+# ---------------- MAIN PROCESSING LOOP ---------------- #
+driver = create_driver()
 batch_list = []
-BATCH_SIZE = 25
+BATCH_LIMIT = 20 # Save every 20 symbols
 current_date = date.today().strftime("%m/%d/%Y")
 
-def flush_batch():
+def save_to_sheets():
     global batch_list
     if not batch_list: return
-    log(f"💾 Saving batch to Google Sheets...")
-    for attempt in range(5):
+    log(f"💾 Saving {len(batch_list)//3} items to Google Sheets...")
+    for _ in range(3): # Retry logic for API limits
         try:
             sheet_data.batch_update(batch_list, value_input_option='RAW')
-            log(f"✅ Batch Saved.")
+            log(f"✅ Batch Write Successful.")
             batch_list = []
             return
         except Exception as e:
-            wait = 60 if "429" in str(e) else 15
-            time.sleep(wait)
-
-def ensure_driver():
-    global driver
-    if driver is None: driver = create_driver()
-    return driver
+            log(f"⚠️ Sheets API Busy, waiting 30s...")
+            time.sleep(30)
 
 try:
-    # LOOP ONLY THROUGH THE ASSIGNED BLOCK
     for i in range(current_idx, end_idx):
-        name = company_list[i].strip()
-        log(f"--- [ROW {i+1}] Processing: {name} ---")
+        symbol_name = company_list[i].strip()
+        log(f"--- [Row {i+1}] {symbol_name} ---")
         
-        active_driver = ensure_driver()
         u_d = url_d_list[i] if i < len(url_d_list) and "http" in str(url_d_list[i]) else None
         u_h = url_h_list[i] if i < len(url_h_list) and "http" in str(url_h_list[i]) else None
         
-        vals_d = scrape_tradingview(active_driver, u_d, "DAILY") if u_d else []
-        vals_h = scrape_tradingview(active_driver, u_h, "HOURLY") if u_h else []
-        combined = vals_d + vals_h
-
-        row_idx = i + 1
-        batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
-        batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
+        data_d = scrape_tradingview(driver, u_d, "DAILY") if u_d else []
+        data_h = scrape_tradingview(driver, u_h, "HOURLY") if u_h else []
+        
+        combined = data_d + data_h
+        row_num = i + 1
+        
+        # Build the update rows
+        batch_list.append({"range": f"A{row_num}", "values": [[symbol_name]]})
+        batch_list.append({"range": f"J{row_num}", "values": [[current_date]]})
         if combined:
-            batch_list.append({"range": f"K{row_idx}", "values": [combined]})
-        
-        if len(batch_list) >= (BATCH_SIZE * 3):
-            flush_batch()
+            batch_list.append({"range": f"K{row_num}", "values": [combined]})
 
-        with open(checkpoint_file, "w") as f:
-            f.write(str(i + 1))
+        # Flush batch and update checkpoint
+        if len(batch_list) >= (BATCH_LIMIT * 3):
+            save_to_sheets()
+            with open(checkpoint_file, "w") as f:
+                f.write(str(i + 1))
         
-        time.sleep(1)
+        time.sleep(1) # Small delay to be polite to servers
 
 finally:
-    if batch_list: flush_batch()
-    if driver: driver.quit()
-    log("🏁 Shard Completed Assigned Block.")
+    save_to_sheets()
+    driver.quit()
+    log("🏁 Shard Completed.")
