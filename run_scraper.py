@@ -18,13 +18,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 def log(msg):
     print(msg, flush=True)
 
-# ---------------- CONFIG & SHARDING ---------------- #
+# ---------------- CONFIG & SEQUENTIAL SHARDING ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP  = int(os.getenv("SHARD_STEP", "25")) 
+SHARD_SIZE  = int(os.getenv("SHARD_SIZE", "500")) 
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
-last_i = int(open(checkpoint_file).read().strip()) if os.path.exists(checkpoint_file) else 0
-
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------------- BROWSER FACTORY ---------------- #
@@ -42,7 +40,7 @@ def create_driver():
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    driver.set_page_load_timeout(90) # Increased timeout for slow connections
+    driver.set_page_load_timeout(90)
 
     if os.path.exists("cookies.json"):
         try:
@@ -63,91 +61,89 @@ def create_driver():
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
-    log(f"   📡 Navigating to {url_type}: {url}")
+    log(f"    📡 Navigating to {url_type}: {url}")
     for attempt in range(3):
         try:
             driver.get(url)
-            
-            # 1. HARD WAIT FOR UI ELEMENTS (Wait up to 60s)
             try:
                 WebDriverWait(driver, 60).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']"))
                 )
             except TimeoutException:
-                log(f"   ⏳ Elements didn't appear quickly on {url_type}, trying to force load...")
+                log(f"    ⏳ Timeout on {url_type}, trying force load...")
 
-            # 2. SCROLL DOWN/UP to trigger lazy-loading elements
             driver.execute_script("window.scrollTo(0, 400);")
             time.sleep(2)
             driver.execute_script("window.scrollTo(0, 0);")
-
-            # 3. INCREASED JS RENDER WAIT (25 Seconds)
-            # This ensures complex technical indicators have time to calculate and display
             time.sleep(25) 
             
             soup = BeautifulSoup(driver.page_source, "html.parser")
             v1 = [el.get_text().strip() for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")]
             v2 = [el.get_text().strip() for el in soup.find_all("div", class_=lambda x: x and 'valueValue' in x)]
-            v3 = [el.text.strip() for el in driver.find_elements(By.XPATH, "//div[contains(@class, 'value') and contains(@class, 'Value')]")]
             
-            raw_values = v1 or v2 or v3
-            final_values = [str(v) for v in raw_values if v is not None]
+            raw_values = v1 or v2
+            # FILTER ∅ and —
+            final_values = [str(v) for v in raw_values if v and v != "∅" and v != "—"]
             
-            if final_values:
-                preview = ", ".join(final_values[:5])
-                log(f"   ✅ {url_type} SUCCESS: Found {len(final_values)} values [{preview}..]")
+            if final_values and len(final_values) > 5:
                 return final_values
             else:
-                log(f"   ⚠️ {url_type} EMPTY (Attempt {attempt+1}/3). Retrying...")
+                log(f"    ⚠️ Data Invalid (∅). Retry {attempt+1}/3...")
                 driver.refresh()
-                time.sleep(10) # Wait longer after refresh
+                time.sleep(15)
         except Exception as e:
-            log(f"   ❌ {url_type} ERROR: {str(e)[:80]}")
+            log(f"    ❌ Error: {str(e)[:50]}")
             time.sleep(5)
     return []
 
-# ---------------- ANTI-COLLISION STARTUP ---------------- #
-startup_wait = random.uniform(5, 60)
-log(f"⏳ Startup Jitter: Waiting {startup_wait:.1f}s...")
-time.sleep(startup_wait)
-
-# ---------------- SETUP ---------------- #
+# ---------------- SETUP DATA ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
     
-    company_list = sheet_main.col_values(1)
-    url_d_list = sheet_main.col_values(4)
-    url_h_list = sheet_main.col_values(8)
-    log(f"✅ Data loaded: {len(company_list)} tickers.")
+    all_names = sheet_main.col_values(1)
+    all_url_d = sheet_main.col_values(4)
+    all_url_h = sheet_main.col_values(8)
+    total_symbols = len(all_names)
+    log(f"✅ Total Symbols Found: {total_symbols}")
 except Exception as e:
     log(f"❌ Connection Error: {e}"); sys.exit(1)
+
+# ---------------- RANGE CALCULATION ---------------- #
+start_row = SHARD_INDEX * SHARD_SIZE
+# Final Shard (4) takes everything left + 300 buffer safety
+if SHARD_INDEX == 4:
+    end_row = total_symbols
+else:
+    end_row = start_row + SHARD_SIZE
+
+# Resuming from checkpoint
+current_start = int(open(checkpoint_file).read().strip()) if os.path.exists(checkpoint_file) else start_row
+current_start = max(start_row, current_start)
+
+log(f"🚀 Shard {SHARD_INDEX} processing indices {current_start} to {end_row}")
 
 # ---------------- MAIN LOOP ---------------- #
 driver = None
 batch_list = []
-BATCH_SIZE = 100 
+BATCH_SIZE = 25
 current_date = date.today().strftime("%m/%d/%Y")
 
 def flush_batch():
     global batch_list
     if not batch_list: return
-    jitter = random.uniform(5, 15)
-    log(f"🚀 [Shard {SHARD_INDEX}] BUFFER FULL. Jittering {jitter:.1f}s before saving...")
-    time.sleep(jitter) 
     for attempt in range(5):
         try:
             sheet_data.batch_update(batch_list, value_input_option='RAW')
-            log(f"✅ [Shard {SHARD_INDEX}] Batch Written Successfully.")
+            log(f"✅ Batch Saved.")
             batch_list = []
             return
         except Exception as e:
-            msg = str(e)
-            wait = 60 if "429" in msg else 15
-            log(f"⚠️ API Error: {msg[:50]}. Retrying in {wait}s...")
-            time.sleep(wait + random.uniform(2, 8))
+            wait = 60 if "429" in str(e) else 15
+            log(f"⚠️ API Error. Retrying in {wait}s...")
+            time.sleep(wait)
 
 def ensure_driver():
     global driver
@@ -155,16 +151,15 @@ def ensure_driver():
     return driver
 
 try:
-    for i in range(last_i, len(company_list)):
-        if i % SHARD_STEP != SHARD_INDEX: continue
-
-        name = company_list[i].strip()
+    for i in range(current_start, end_row):
+        if i >= len(all_names): break # Buffer safety
+        
+        name = all_names[i].strip()
         log(f"--- [ROW {i+1}] {name} ---")
 
         active_driver = ensure_driver()
-        
-        u_d = url_d_list[i] if i < len(url_d_list) and url_d_list[i].startswith("http") else None
-        u_h = url_h_list[i] if i < len(url_h_list) and url_h_list[i].startswith("http") else None
+        u_d = all_url_d[i] if i < len(all_url_d) and all_url_d[i].startswith("http") else None
+        u_h = all_url_h[i] if i < len(all_url_h) and all_url_h[i].startswith("http") else None
         
         vals_d = scrape_tradingview(active_driver, u_d, "DAILY") if u_d else []
         vals_h = scrape_tradingview(active_driver, u_h, "HOURLY") if u_h else []
@@ -176,10 +171,6 @@ try:
         if combined:
             batch_list.append({"range": f"K{row_idx}", "values": [combined]})
         
-        # Buffer progress
-        cur_len = len(batch_list) // 3
-        log(f"📊 Buffer Status: {cur_len}/{BATCH_SIZE}")
-
         if len(batch_list) >= (BATCH_SIZE * 3):
             flush_batch()
 
@@ -189,8 +180,6 @@ try:
         time.sleep(2)
 
 finally:
-    if batch_list:
-        flush_batch()
-    if driver: 
-        driver.quit()
+    if batch_list: flush_batch()
+    if driver: driver.quit()
     log("🏁 Shard Completed.")
