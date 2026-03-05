@@ -1,4 +1,4 @@
-name: Scraper 1-500
+name: Scraper Shard 0 (1-500)
 on:
   schedule:
     - cron: '0 0 * * *'
@@ -15,8 +15,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
       - name: Install dependencies
-        run: pip install selenium webdriver-manager beautifulsoup4 gspread
+        run: pip install selenium webdriver-manager beautifulsoup4 gspread google-auth
+      - name: Create credentials.json
+        run: echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
       - name: Run Scraper
         run: python run_scraper.py
