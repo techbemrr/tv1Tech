@@ -32,42 +32,45 @@ def create_driver():
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-    driver.set_page_load_timeout(90)
+    driver.set_page_load_timeout(120)
     return driver
 
-# ---------------- SCRAPER (Fixed JS & Wait) ---------------- #
+# ---------------- SCRAPER (Enhanced Detection) ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
     log(f"   📡 {url_type}: {url}")
     for attempt in range(1, 4):
         try:
             driver.get(url)
-            wait = WebDriverWait(driver, 35)
-            val_css = "[class*='valueValue']"
+            wait = WebDriverWait(driver, 45)
             
-            # Wait for elements
+            # This selector covers almost all technical indicator value types on TradingView
+            val_css = "[class*='valueValue'], [class*='counter-'], .js-symbol-last"
+            
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, val_css)))
             
-            # Smart Wait for real data (Fixed placeholder check)
-            try:
-                wait.until(lambda d: d.find_element(By.CSS_SELECTOR, val_css).text.strip() not in ["", "Requested symbol not found", "∅", "—", "0"])
-            except:
-                log(f"   ⏳ Calculations pending... short pause.")
-                time.sleep(15)
-
-            # FIXED JAVASCRIPT: Used .trim() instead of .strip()
+            # Scroll to trigger any lazy-loaded indicator tables
+            driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(15) # Essential for TradingView JS math to finish
+            
+            # FIXED JAVASCRIPT: Comprehensive extraction
             raw_data = driver.execute_script("""
-                return Array.from(document.querySelectorAll("[class*='valueValue']")).map(el => el.innerText.trim());
+                const elements = document.querySelectorAll("[class*='valueValue'], .js-symbol-last");
+                return Array.from(elements).map(el => el.innerText.trim());
             """)
             
-            clean_data = [str(v) for v in raw_data if v and v not in ["Detailed", "∅", "—"]]
+            # Filter out UI text, keeping only numbers/signals
+            clean_data = [str(v) for v in raw_data if v and v not in ["Detailed", "∅", "—", "Neutral", "Buy", "Sell"]]
             
-            if len(clean_data) > 5:
-                log(f"   ✅ SUCCESS: Captured {len(clean_data)} indicators.")
+            # If you want the signals (Buy/Sell) included, remove "Neutral", "Buy", "Sell" from the list above.
+            
+            if len(clean_data) > 3:
+                log(f"   ✅ {url_type} SUCCESS: Found {len(clean_data)} indicators.")
+                log(f"   📊 DATA OBTAINED: {', '.join(clean_data[:15])}...") # Shows what it got in logs
                 return clean_data
             else:
-                log(f"   ⚠️ Incomplete data. Refreshing...")
+                log(f"   ⚠️ Attempt {attempt}: Low indicator count ({len(clean_data)}). Retrying...")
                 driver.refresh()
-                time.sleep(5)
+                time.sleep(10)
         except Exception as e:
             log(f"   ❌ {url_type} Error: {str(e)[:60]}")
     return []
@@ -84,7 +87,7 @@ try:
     url_h_list = sheet_main.col_values(8)
     total_count = len(company_list)
 except Exception as e:
-    log(f"❌ Error: {e}"); sys.exit(1)
+    log(f"❌ Connection Error: {e}"); sys.exit(1)
 
 # ---------------- RANGE LOGIC ---------------- #
 start_idx = SHARD_INDEX * SHARD_SIZE
@@ -98,7 +101,7 @@ else:
     current_idx = start_idx
 
 current_idx = max(start_idx, current_idx)
-log(f"🚀 Processing Rows {start_idx+1} to {end_idx} (Starting at {current_idx+1})")
+log(f"🚀 Processing Rows {start_idx+1} to {end_idx}")
 
 # ---------------- MAIN ---------------- #
 driver = create_driver()
@@ -108,18 +111,18 @@ current_date = date.today().strftime("%m/%d/%Y")
 def save_to_sheets():
     global batch_list
     if not batch_list: return
-    log(f"💾 Saving to Sheets...")
+    log(f"💾 Updating Google Sheets...")
     try:
         sheet_data.batch_update(batch_list, value_input_option='RAW')
         batch_list = []
+        log(f"✅ Sheets Sync Complete.")
     except Exception as e:
-        log(f"⚠️ Sheets API error: {e}")
+        log(f"⚠️ Sheets API Error: {e}")
 
 try:
     for i in range(current_idx, end_idx):
         symbol_name = company_list[i].strip()
-        # Skip header if Row 1 is 'Symbol'
-        if symbol_name.lower() == "symbol": continue
+        if symbol_name.lower() == "symbol" or not symbol_name: continue
 
         log(f"--- [Row {i+1}] {symbol_name} ---")
         
@@ -137,7 +140,7 @@ try:
         if combined:
             batch_list.append({"range": f"K{row_num}", "values": [combined]})
 
-        if len(batch_list) >= 45: # Save every 15 symbols (15 symbols * 3 updates = 45)
+        if len(batch_list) >= 30: # Save every 10 stocks
             save_to_sheets()
             with open(checkpoint_file, "w") as f:
                 f.write(str(i + 1))
@@ -147,4 +150,4 @@ try:
 finally:
     save_to_sheets()
     driver.quit()
-    log("🏁 Task Finished.")
+    log("🏁 All Task Finished.")
