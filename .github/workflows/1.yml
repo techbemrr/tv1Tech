@@ -1,4 +1,4 @@
-name: T3 Shard 0 (Rows 1-510)
+name: T1 Shard 0 (Rows 1-510)
 on:
   workflow_dispatch:
   schedule:
