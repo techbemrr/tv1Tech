@@ -19,4 +19,4 @@ jobs:
       - name: Install dependencies
         run: pip install selenium webdriver-manager beautifulsoup4 gspread
       - name: Run Scraper
-        run: python run_scraper.py.py
+        run: python run_scraper.py
