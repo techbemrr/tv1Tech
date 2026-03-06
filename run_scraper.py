@@ -147,7 +147,7 @@ except Exception as e:
 # ---------------- MAIN LOOP ---------------- #
 driver = None
 batch_list = []
-BATCH_SIZE = 25
+BATCH_SIZE = 100
 current_date = date.today().strftime("%m/%d/%Y")
 
 def flush_batch():
