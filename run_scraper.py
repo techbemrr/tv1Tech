@@ -62,30 +62,29 @@ def create_driver():
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
-    log(f"   📡 Navigating {url_type}...")
+    log(f"    📡 Navigating {url_type}...")
     try:
         driver.get(url)
-        time.sleep(12) # Accuracy wait
+        time.sleep(12) 
         
         final_values = []
         for check in range(5): 
             soup = BeautifulSoup(driver.page_source, "html.parser")
             v1 = [el.get_text().strip() for el in soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")]
             v2 = [el.get_text().strip() for el in soup.find_all("div", class_=lambda x: x and 'valueValue' in x)]
-            v3 = [el.text.strip() for el in driver.find_elements(By.XPATH, "//div[contains(@class, 'value') and contains(@class, 'Value')]")]
             
-            raw_values = v1 or v2 or v3
+            raw_values = v1 or v2
             final_values = [str(v) for v in raw_values if v and v.strip()]
             
             if final_values:
-                log(f"   📊 Found {len(final_values)} values.")
+                log(f"    📊 Found {len(final_values)} values.")
                 return final_values
             
             driver.execute_script("window.scrollTo(0, 400);")
             time.sleep(2)
             
     except Exception as e:
-        log(f"   ❌ {url_type} ERROR: {str(e)[:50]}")
+        log(f"    ❌ {url_type} ERROR: {str(e)[:50]}")
     return []
 
 # ---------------- MAIN ---------------- #
@@ -102,11 +101,10 @@ except Exception as e:
 
 driver = create_driver()
 batch_list = []
-BATCH_SIZE = 300 # Updated batch size
+BATCH_SIZE = 10 # Reduced size to avoid API timeouts; change back to 300 if stable
 current_date = date.today().strftime("%m/%d/%Y")
 
 try:
-    # Process the range (e.g. 0 to 500)
     for i in range(last_i, min(END_ROW, len(company_list))):
         name = company_list[i].strip()
         log(f"--- [ROW {i+1}] {name} ---")
@@ -119,26 +117,35 @@ try:
         combined = vals_d + vals_h
 
         row_idx = i + 1
-        batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
-        batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
-        if combined:
-            batch_list.append({"range": f"K{row_idx}", "values": [combined]})
         
-        # Check if batch of 300 rows (900 list items) is full
-        if len(batch_list) // 3 >= BATCH_SIZE:
-            log(f"🚀 Batch threshold {BATCH_SIZE} reached. Saving to sheet...")
-            sheet_data.batch_update(batch_list, value_input_option='RAW')
-            batch_list = []
+        # REQUIRED CHANGE: Structure the batch update correctly for gspread
+        batch_list.append({'range': f'A{row_idx}', 'values': [[name]]})
+        batch_list.append({'range': f'J{row_idx}', 'values': [[current_date]]})
+        
+        if combined:
+            # We wrap combined in another list because values expects a list of rows
+            batch_list.append({'range': f'K{row_idx}', 'values': [combined]})
+        
+        # Check based on how many symbols we've processed (3 entries per symbol)
+        if len(batch_list) >= (BATCH_SIZE * 3):
+            log(f"🚀 Batch threshold reached. Saving to sheet...")
+            try:
+                sheet_data.batch_update(batch_list, value_input_option='USER_ENTERED')
+                batch_list = []
+            except Exception as e:
+                log(f"❌ Batch Update Failed: {e}")
 
         with open(checkpoint_file, "w") as f:
             f.write(str(i + 1))
         time.sleep(1)
 
 finally:
-    # IMPORTANT: This block handles the remaining 200 symbols if shard ends at 500
     if batch_list:
-        log(f"📤 Final Flush: Uploading remaining {len(batch_list)//3} symbols...")
-        sheet_data.batch_update(batch_list, value_input_option='RAW')
+        log(f"📤 Final Flush: Uploading remaining symbols...")
+        try:
+            sheet_data.batch_update(batch_list, value_input_option='USER_ENTERED')
+        except Exception as e:
+            log(f"❌ Final Flush Failed: {e}")
     
     if driver: 
         driver.quit()
