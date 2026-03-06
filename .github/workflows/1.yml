@@ -3,7 +3,7 @@ name: T1 Shard 0-4 (Rows 1-510)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 11 * * 1-5'
+    - cron: '5 11 * * 1-5'
 
 jobs:
   scrape:
