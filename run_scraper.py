@@ -26,8 +26,7 @@ END_ROW   = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 if os.path.exists(checkpoint_file):
     try:
-        saved = int(open(checkpoint_file).read().strip())
-        last_i = max(saved, START_ROW)
+        last_i = max(int(open(checkpoint_file).read().strip()), START_ROW)
     except:
         last_i = START_ROW
 else:
@@ -40,7 +39,7 @@ def create_driver():
     log(f"🌐 [Shard {SHARD_INDEX}] Range {START_ROW+1}-{END_ROW} | Initializing...")
     opts = Options()
 
-    # same site path, just safer loading
+    # Same paths/URLs; just safer and more stable for TradingView
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -87,67 +86,75 @@ def create_driver():
 def normalize_text(x):
     return x.replace("\u202f", " ").replace("\xa0", " ").strip()
 
-def looks_wrong(values):
+def get_visible_values(driver):
+    values = []
+    elems = driver.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
+    for el in elems:
+        try:
+            if el.is_displayed():
+                txt = normalize_text(el.text)
+                if txt:
+                    values.append(txt)
+        except:
+            pass
+
+    if values:
+        return values
+
+    # fallback
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    raw_values = soup.find_all("div", class_=lambda x: x and "valueValue" in x)
+    out = []
+    for el in raw_values:
+        txt = normalize_text(el.get_text(strip=True))
+        if txt:
+            out.append(txt)
+    return out
+
+def looks_suspicious(values):
     if not values or len(values) < 8:
         return True
 
-    first = [normalize_text(v) for v in values[:8]]
+    first = values[:8]
 
-    # known bad patterns from your logs
     bad_prefixes = [
         ["1", "3", "5"],
-        ["1", "70", "70"],
         ["1", "89", "89"],
-        ["1", "4", "4"],
-        ["1", "19", "19"],
-        ["1", "28", "28"],
-        ["1", "46", "46"],
-        ["1", "50", "50"],
+        ["1", "70", "70"],
         ["1", "75", "75"],
+        ["1", "50", "50"],
+        ["1", "46", "46"],
+        ["1", "28", "28"],
+        ["1", "19", "19"],
+        ["1", "14", "14"],
+        ["1", "4", "4"],
     ]
-
     for bp in bad_prefixes:
         if first[:len(bp)] == bp:
             return True
 
-    # too many tiny integers in first few values => suspicious UI data
-    small_numeric = 0
+    # Agar first few values me bohot chhote UI-like numbers hon
+    small_count = 0
     for v in first[:6]:
         t = v.replace(",", "").replace("−", "-").strip()
         try:
             num = float(t)
             if abs(num) <= 10:
-                small_numeric += 1
+                small_count += 1
         except:
             pass
 
-    if small_numeric >= 4:
-        return True
+    return small_count >= 4
 
-    return False
-
-def extract_values_fast(driver):
-    elems = driver.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
-    vals = []
-    for el in elems:
-        try:
-            txt = el.text.strip()
-            if txt:
-                vals.append(normalize_text(txt))
-        except:
-            pass
-
-    if vals:
-        return vals
-
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    raw_values = soup.find_all("div", class_=lambda x: x and "valueValue" in x)
-    vals = []
-    for el in raw_values:
-        txt = el.get_text(strip=True)
-        if txt:
-            vals.append(normalize_text(txt))
-    return vals
+def restart_driver():
+    global driver
+    try:
+        if driver:
+            log("♻️ Restarting browser...")
+            driver.quit()
+    except:
+        pass
+    driver = None
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(driver, url, url_type=""):
@@ -158,10 +165,10 @@ def scrape_tradingview(driver, url, url_type=""):
 
     for attempt in range(3):
         try:
-            log(f"   ⏳ {url_type} attempt {attempt + 1}")
+            log(f"   ⏳ {url_type} Attempt {attempt + 1}")
             driver.get(url)
 
-            # keep same path, just stronger wait
+            # Wait only for actual values, not just document.readyState
             try:
                 WebDriverWait(driver, 20).until(
                     lambda d: len(d.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")) >= 8
@@ -170,30 +177,36 @@ def scrape_tradingview(driver, url, url_type=""):
                 pass
 
             driver.execute_script("window.scrollTo(0, 250);")
-            time.sleep(0.6)
+            time.sleep(0.7)
             driver.execute_script("window.scrollTo(0, 0);")
             time.sleep(2.5)
 
-            final_values = extract_values_fast(driver)
+            final_values = get_visible_values(driver)
 
-            if final_values and not looks_wrong(final_values):
+            if final_values and not looks_suspicious(final_values):
                 log(f"   📊 Found {len(final_values)} values for {url_type}")
                 log(f"   📝 Data Preview: {final_values[:8]}...")
                 return final_values
 
-            log(f"   ⚠️ {url_type} wrong/empty values detected on attempt {attempt + 1}")
+            log(f"   ⚠️ {url_type} suspicious/incorrect values detected.")
             if final_values:
                 log(f"   📝 Suspicious Preview: {final_values[:8]}...")
 
-            if attempt < 2:
+            # Retry with refresh once, then fresh browser on last retry
+            if attempt == 0:
                 try:
                     driver.refresh()
                 except:
                     pass
                 time.sleep(3)
+            elif attempt == 1:
+                restart_driver()
+                fresh_driver = ensure_driver()
+                driver = fresh_driver
+                time.sleep(2)
 
         except Exception as e:
-            log(f"   ❌ {url_type} ERROR: {str(e)[:80]}")
+            log(f"   ❌ {url_type} ERROR: {str(e)[:100]}")
             time.sleep(2)
 
     return []
@@ -205,9 +218,10 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
 
+    # SAME PATH / SAME COLUMNS
     company_list = sheet_main.col_values(1)
-    url_d_list = sheet_main.col_values(4)   # SAME
-    url_h_list = sheet_main.col_values(8)   # SAME
+    url_d_list = sheet_main.col_values(4)
+    url_h_list = sheet_main.col_values(8)
 
     log(f"✅ Data Ready. Starting from Row {last_i + 1}")
 except Exception as e:
@@ -224,20 +238,20 @@ current_date = date.today().strftime("%m/%d/%Y")
 def flush_batch():
     global batch_list, buffered_rows
     if not batch_list:
-        return False
+        return True
 
     log(f"🚀 UPLOADING BATCH: Sending {buffered_rows} rows to Google Sheets...")
 
     for attempt in range(3):
         try:
-            sheet_data.batch_update(batch_list, value_input_option="RAW")
+            sheet_data.batch_update(batch_list, value_input_option='RAW')
             log("✅ SUCCESS: Batch successfully written to Sheet2.")
             batch_list = []
             buffered_rows = 0
             return True
         except Exception as e:
             log(f"⚠️ API Retry {attempt+1}: {str(e)[:120]}")
-            time.sleep(8 + attempt * 5)
+            time.sleep(8 + (attempt * 5))
 
     return False
 
@@ -246,16 +260,6 @@ def ensure_driver():
     if driver is None:
         driver = create_driver()
     return driver
-
-def restart_driver():
-    global driver
-    try:
-        if driver:
-            log("♻️ Restarting browser for stability...")
-            driver.quit()
-    except:
-        pass
-    driver = None
 
 try:
     loop_end = min(END_ROW, len(company_list))
@@ -283,7 +287,7 @@ try:
         if combined:
             log(f"   📥 Buffered {len(combined)} values into batch.")
         else:
-            log("   ⚠️ No valid values found, buffering blank K cell.")
+            log("   ⚠️ No valid values found. Writing blank K cell.")
 
         log(f"📈 Shard Progress: {i+1}/{loop_end} | Batch Buffer: {buffered_rows}/{BATCH_SIZE}")
 
@@ -292,7 +296,10 @@ try:
 
         if buffered_rows >= BATCH_SIZE:
             ok = flush_batch()
-            restart_driver()   # most important fix
+
+            # Most important fix: after batch complete, restart browser
+            restart_driver()
+
             if not ok:
                 log("❌ Batch upload failed after retries.")
                 break
