@@ -181,7 +181,7 @@ except Exception as e:
 # ---------------- MAIN LOOP ---------------- #
 batch_list = []
 buffered_rows = 0
-BATCH_SIZE = 100
+BATCH_SIZE = 50
 current_date = date.today().strftime("%m/%d/%Y")
 
 def flush_batch():
