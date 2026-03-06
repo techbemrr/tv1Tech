@@ -2,37 +2,41 @@ import sys
 import os
 import time
 import json
+import re
 from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from bs4 import BeautifulSoup
+from selenium.webdriver.common.action_chains import ActionChains
 import gspread
 from webdriver_manager.chrome import ChromeDriverManager
+
 
 def log(msg):
     t = time.strftime("%H:%M:%S")
     print(f"[{t}] {msg}", flush=True)
 
+
 # ---------------- CONFIG & RANGE CALCULATION ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_SIZE  = int(os.getenv("SHARD_SIZE", "500"))
+SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 
 START_ROW = SHARD_INDEX * SHARD_SIZE
-END_ROW   = START_ROW + SHARD_SIZE
+END_ROW = START_ROW + SHARD_SIZE
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 if os.path.exists(checkpoint_file):
     try:
         last_i = max(int(open(checkpoint_file).read().strip()), START_ROW)
-    except:
+    except Exception:
         last_i = START_ROW
 else:
     last_i = START_ROW
 
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
+
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
@@ -69,7 +73,7 @@ def create_driver():
                         k: v for k, v in c.items()
                         if k in ("name", "value", "path", "secure", "expiry")
                     })
-                except:
+                except Exception:
                     continue
 
             drv.refresh()
@@ -79,14 +83,17 @@ def create_driver():
             log(f"⚠️ Cookie error: {str(e)[:80]}")
     return drv
 
+
 # ---------------- DRIVER HELPERS ---------------- #
 driver = None
+
 
 def ensure_driver():
     global driver
     if driver is None:
         driver = create_driver()
     return driver
+
 
 def restart_driver():
     global driver
@@ -99,33 +106,136 @@ def restart_driver():
     driver = None
     time.sleep(3)
 
-# ---------------- TARGETED EXTRACTION ---------------- #
-def extract_from_target_panel(drv):
-    selectors = [
-        "div[data-name='legend-source-item'] div[class*='valueValue']",
-        "div[class*='legend'] div[class*='valueValue']",
-        "div[class*='valuesWrapper'] div[class*='valueValue']",
-        "div[class*='container'] div[class*='valueValue']",
-    ]
 
-    for sel in selectors:
+# ---------------- EXTRACTION HELPERS ---------------- #
+STRICT_VALUE_SELECTORS = [
+    "div[data-name='legend-source-item'] div[class*='valueValue']",
+    "div[data-name='legend-source-item'] span[class*='valueValue']",
+    "div[class*='legend-source-item'] div[class*='valueValue']",
+    "div[class*='legend-source-item'] span[class*='valueValue']",
+]
+
+STRICT_CONTAINER_SELECTORS = [
+    "div[data-name='legend-source-item']",
+    "div[class*='legend-source-item']",
+]
+
+
+def clean_text(text):
+    return (
+        text.replace("\u202f", " ")
+        .replace("\xa0", " ")
+        .replace("−", "-")
+        .strip()
+    )
+
+
+def is_small_int(text):
+    t = clean_text(text).replace(",", "")
+    return re.fullmatch(r"\d+", t) is not None and int(t) <= 500
+
+
+def is_numberish(text):
+    t = clean_text(text).replace(",", "")
+    return re.fullmatch(r"[+-]?\d+(\.\d+)?", t) is not None
+
+
+def looks_like_junk_prefix(values):
+    if len(values) < 4:
+        return False
+    # catches patterns like 1,3,6 or 1,50,50 before real-looking values
+    return (
+        is_small_int(values[0]) and
+        is_small_int(values[1]) and
+        is_small_int(values[2]) and
+        is_numberish(values[3])
+    )
+
+
+def extract_strict_values(drv):
+    values = []
+
+    for sel in STRICT_VALUE_SELECTORS:
         try:
             elems = drv.find_elements(By.CSS_SELECTOR, sel)
-            vals = []
+            current = []
             for el in elems:
                 try:
                     if el.is_displayed():
-                        txt = el.text.strip()
+                        txt = clean_text(el.text)
                         if txt:
-                            vals.append(txt)
-                except:
+                            current.append(txt)
+                except Exception:
                     pass
-            if vals:
-                return vals
-        except:
+            if current:
+                values = current
+                break
+        except Exception:
             pass
 
-    return []
+    if values:
+        return values
+
+    # JS fallback from exact legend container only
+    js = """
+    const containerSelectors = arguments[0];
+    const valueSelectors = arguments[1];
+
+    function visible(el) {
+        if (!el) return false;
+        const st = window.getComputedStyle(el);
+        return st && st.display !== 'none' && st.visibility !== 'hidden' && el.offsetParent !== null;
+    }
+
+    for (const csel of containerSelectors) {
+        const containers = Array.from(document.querySelectorAll(csel));
+        for (const c of containers) {
+            if (!visible(c)) continue;
+            for (const vsel of valueSelectors) {
+                const nodes = Array.from(c.querySelectorAll(vsel));
+                const vals = nodes
+                    .filter(n => visible(n))
+                    .map(n => (n.innerText || n.textContent || '').trim())
+                    .filter(Boolean);
+                if (vals.length) return vals;
+            }
+        }
+    }
+    return [];
+    """
+    try:
+        vals = drv.execute_script(js, STRICT_CONTAINER_SELECTORS, ["div[class*='valueValue']", "span[class*='valueValue']"])
+        return [clean_text(x) for x in vals if clean_text(x)]
+    except Exception:
+        return []
+
+
+def wait_for_strict_values(drv, timeout=18):
+    def _ready(d):
+        for sel in STRICT_VALUE_SELECTORS:
+            try:
+                elems = d.find_elements(By.CSS_SELECTOR, sel)
+                visible = [e for e in elems if e.is_displayed() and clean_text(e.text)]
+                if visible:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    WebDriverWait(drv, timeout).until(lambda d: _ready(d))
+
+
+def nudge_chart(drv):
+    try:
+        drv.execute_script("window.scrollTo(0, 250);")
+        time.sleep(0.6)
+        drv.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1.2)
+        ActionChains(drv).move_by_offset(20, 20).click().perform()
+        time.sleep(0.8)
+    except Exception:
+        pass
+
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(url, url_type=""):
@@ -134,40 +244,33 @@ def scrape_tradingview(url, url_type=""):
 
     log(f"   📡 Navigating {url_type}: {url}")
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             drv = ensure_driver()
             drv.get(url)
 
             try:
-                WebDriverWait(drv, 15).until(
-                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")) > 0
-                )
-            except:
+                wait_for_strict_values(drv, timeout=18)
+            except Exception:
                 pass
 
-            drv.execute_script("window.scrollTo(0, 250);")
-            time.sleep(0.8)
-            drv.execute_script("window.scrollTo(0, 0);")
-            time.sleep(3)
+            nudge_chart(drv)
 
-            # only necessary change: read from target panel first
-            final_values = extract_from_target_panel(drv)
+            final_values = extract_strict_values(drv)
 
-            if not final_values:
-                soup = BeautifulSoup(drv.page_source, "html.parser")
-                raw_values = soup.select("div[data-name='legend-source-item'] div[class*='valueValue']")
-                final_values = [el.get_text(strip=True) for el in raw_values if el.get_text(strip=True)]
+            if final_values and looks_like_junk_prefix(final_values):
+                log(f"   ⚠️ {url_type} junk-looking values detected: {final_values[:8]}...")
+                final_values = []
 
             if final_values:
                 log(f"   📊 Found {len(final_values)} values for {url_type}")
                 log(f"   📝 Data Preview: {final_values[:8]}...")
                 return final_values
 
-            log(f"   ⚠️ {url_type} No values found. Refreshing...")
+            log(f"   ⚠️ {url_type} No strict values found. Refreshing...")
             try:
                 drv.refresh()
-            except:
+            except Exception:
                 restart_driver()
             time.sleep(3)
 
@@ -178,6 +281,7 @@ def scrape_tradingview(url, url_type=""):
 
     return []
 
+
 # ---------------- SHEETS SETUP ---------------- #
 def connect_sheets():
     log("📊 Connecting to Google Sheets...")
@@ -186,23 +290,26 @@ def connect_sheets():
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
     return sheet_main, sheet_data
 
+
 try:
     sheet_main, sheet_data = connect_sheets()
 
     company_list = sheet_main.col_values(1)
-    url_d_list = sheet_main.col_values(4)
-    url_h_list = sheet_main.col_values(8)
+    url_d_list = sheet_main.col_values(4)   # D
+    url_h_list = sheet_main.col_values(8)   # H
 
     log(f"✅ Data Ready. Starting from Row {last_i + 1}")
 except Exception as e:
     log(f"❌ Connection Error: {e}")
     sys.exit(1)
 
+
 # ---------------- MAIN LOOP ---------------- #
 batch_list = []
 buffered_rows = 0
 BATCH_SIZE = 50
 current_date = date.today().strftime("%m/%d/%Y")
+
 
 def flush_batch():
     global batch_list, buffered_rows, sheet_data
@@ -228,6 +335,7 @@ def flush_batch():
                 log(f"⚠️ Reconnect failed: {str(inner_e)[:120]}")
 
     return False
+
 
 try:
     loop_end = min(END_ROW, len(company_list))
