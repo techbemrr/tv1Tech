@@ -36,10 +36,8 @@ CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
-    log(f"🌐 [Shard {SHARD_INDEX}] Range {START_ROW+1}-{END_ROW} | Initializing...")
+    log(f"🌐 [Shard {SHARD_INDEX}] Range {START_ROW+1}-{END_ROW} | Initializing fresh browser...")
     opts = Options()
-
-    # Same paths/URLs; just safer and more stable for TradingView
     opts.page_load_strategy = "eager"
 
     opts.add_argument("--headless=new")
@@ -54,12 +52,12 @@ def create_driver():
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
-    driver = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    driver.set_page_load_timeout(60)
+    drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
+    drv.set_page_load_timeout(60)
 
     if os.path.exists("cookies.json"):
         try:
-            driver.get("https://in.tradingview.com/")
+            drv.get("https://in.tradingview.com/")
             time.sleep(2)
 
             with open("cookies.json", "r", encoding="utf-8") as f:
@@ -67,158 +65,110 @@ def create_driver():
 
             for c in cookies:
                 try:
-                    payload = {
+                    drv.add_cookie({
                         k: v for k, v in c.items()
                         if k in ("name", "value", "path", "secure", "expiry")
-                    }
-                    driver.add_cookie(payload)
+                    })
                 except:
                     continue
 
-            driver.refresh()
+            drv.refresh()
             time.sleep(2)
             log("✅ Cookies applied.")
         except Exception as e:
             log(f"⚠️ Cookie error: {str(e)[:80]}")
+    return drv
+
+# ---------------- DRIVER HELPERS ---------------- #
+driver = None
+
+def ensure_driver():
+    global driver
+    if driver is None:
+        driver = create_driver()
     return driver
-
-# ---------------- HELPERS ---------------- #
-def normalize_text(x):
-    return x.replace("\u202f", " ").replace("\xa0", " ").strip()
-
-def get_visible_values(driver):
-    values = []
-    elems = driver.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
-    for el in elems:
-        try:
-            if el.is_displayed():
-                txt = normalize_text(el.text)
-                if txt:
-                    values.append(txt)
-        except:
-            pass
-
-    if values:
-        return values
-
-    # fallback
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    raw_values = soup.find_all("div", class_=lambda x: x and "valueValue" in x)
-    out = []
-    for el in raw_values:
-        txt = normalize_text(el.get_text(strip=True))
-        if txt:
-            out.append(txt)
-    return out
-
-def looks_suspicious(values):
-    if not values or len(values) < 8:
-        return True
-
-    first = values[:8]
-
-    bad_prefixes = [
-        ["1", "3", "5"],
-        ["1", "89", "89"],
-        ["1", "70", "70"],
-        ["1", "75", "75"],
-        ["1", "50", "50"],
-        ["1", "46", "46"],
-        ["1", "28", "28"],
-        ["1", "19", "19"],
-        ["1", "14", "14"],
-        ["1", "4", "4"],
-    ]
-    for bp in bad_prefixes:
-        if first[:len(bp)] == bp:
-            return True
-
-    # Agar first few values me bohot chhote UI-like numbers hon
-    small_count = 0
-    for v in first[:6]:
-        t = v.replace(",", "").replace("−", "-").strip()
-        try:
-            num = float(t)
-            if abs(num) <= 10:
-                small_count += 1
-        except:
-            pass
-
-    return small_count >= 4
 
 def restart_driver():
     global driver
     try:
         if driver:
-            log("♻️ Restarting browser...")
+            log("♻️ Closing browser after batch...")
             driver.quit()
-    except:
-        pass
+    except Exception as e:
+        log(f"⚠️ Browser close issue: {str(e)[:80]}")
     driver = None
+    time.sleep(3)
 
 # ---------------- SCRAPER ---------------- #
-def scrape_tradingview(driver, url, url_type=""):
+def scrape_tradingview(url, url_type=""):
     if not url:
         return []
 
     log(f"   📡 Navigating {url_type}: {url}")
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            log(f"   ⏳ {url_type} Attempt {attempt + 1}")
-            driver.get(url)
+            drv = ensure_driver()
+            drv.get(url)
 
-            # Wait only for actual values, not just document.readyState
             try:
-                WebDriverWait(driver, 20).until(
-                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")) >= 8
+                WebDriverWait(drv, 15).until(
+                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")) > 0
                 )
             except:
                 pass
 
-            driver.execute_script("window.scrollTo(0, 250);")
-            time.sleep(0.7)
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(2.5)
+            drv.execute_script("window.scrollTo(0, 250);")
+            time.sleep(0.8)
+            drv.execute_script("window.scrollTo(0, 0);")
+            time.sleep(3)
 
-            final_values = get_visible_values(driver)
+            elems = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
+            final_values = []
 
-            if final_values and not looks_suspicious(final_values):
+            for el in elems:
+                try:
+                    txt = el.text.strip()
+                    if txt:
+                        final_values.append(txt)
+                except:
+                    pass
+
+            if not final_values:
+                soup = BeautifulSoup(drv.page_source, "html.parser")
+                raw_values = soup.find_all("div", class_=lambda x: x and "valueValue" in x)
+                final_values = [el.get_text(strip=True) for el in raw_values if el.get_text(strip=True)]
+
+            if final_values:
                 log(f"   📊 Found {len(final_values)} values for {url_type}")
                 log(f"   📝 Data Preview: {final_values[:8]}...")
                 return final_values
 
-            log(f"   ⚠️ {url_type} suspicious/incorrect values detected.")
-            if final_values:
-                log(f"   📝 Suspicious Preview: {final_values[:8]}...")
-
-            # Retry with refresh once, then fresh browser on last retry
-            if attempt == 0:
-                try:
-                    driver.refresh()
-                except:
-                    pass
-                time.sleep(3)
-            elif attempt == 1:
+            log(f"   ⚠️ {url_type} No values found. Refreshing...")
+            try:
+                drv.refresh()
+            except:
                 restart_driver()
-                fresh_driver = ensure_driver()
-                driver = fresh_driver
-                time.sleep(2)
+            time.sleep(3)
 
         except Exception as e:
             log(f"   ❌ {url_type} ERROR: {str(e)[:100]}")
+            restart_driver()
             time.sleep(2)
 
     return []
 
-# ---------------- SETUP ---------------- #
-log("📊 Connecting to Google Sheets...")
-try:
+# ---------------- SHEETS SETUP ---------------- #
+def connect_sheets():
+    log("📊 Connecting to Google Sheets...")
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
+    return sheet_main, sheet_data
 
-    # SAME PATH / SAME COLUMNS
+try:
+    sheet_main, sheet_data = connect_sheets()
+
     company_list = sheet_main.col_values(1)
     url_d_list = sheet_main.col_values(4)
     url_h_list = sheet_main.col_values(8)
@@ -229,14 +179,14 @@ except Exception as e:
     sys.exit(1)
 
 # ---------------- MAIN LOOP ---------------- #
-driver = None
 batch_list = []
 buffered_rows = 0
 BATCH_SIZE = 100
 current_date = date.today().strftime("%m/%d/%Y")
 
 def flush_batch():
-    global batch_list, buffered_rows
+    global batch_list, buffered_rows, sheet_data
+
     if not batch_list:
         return True
 
@@ -252,14 +202,12 @@ def flush_batch():
         except Exception as e:
             log(f"⚠️ API Retry {attempt+1}: {str(e)[:120]}")
             time.sleep(8 + (attempt * 5))
+            try:
+                _, sheet_data = connect_sheets()
+            except Exception as inner_e:
+                log(f"⚠️ Reconnect failed: {str(inner_e)[:120]}")
 
     return False
-
-def ensure_driver():
-    global driver
-    if driver is None:
-        driver = create_driver()
-    return driver
 
 try:
     loop_end = min(END_ROW, len(company_list))
@@ -268,13 +216,11 @@ try:
         name = company_list[i].strip()
         log(f"--- [ROW {i+1}] Processing: {name} ---")
 
-        active_driver = ensure_driver()
-
         u_d = url_d_list[i].strip() if i < len(url_d_list) and url_d_list[i].startswith("http") else None
         u_h = url_h_list[i].strip() if i < len(url_h_list) and url_h_list[i].startswith("http") else None
 
-        vals_d = scrape_tradingview(active_driver, u_d, "DAILY") if u_d else []
-        vals_h = scrape_tradingview(active_driver, u_h, "HOURLY") if u_h else []
+        vals_d = scrape_tradingview(u_d, "DAILY") if u_d else []
+        vals_h = scrape_tradingview(u_h, "HOURLY") if u_h else []
         combined = vals_d + vals_h
 
         row_idx = i + 1
@@ -287,7 +233,7 @@ try:
         if combined:
             log(f"   📥 Buffered {len(combined)} values into batch.")
         else:
-            log("   ⚠️ No valid values found. Writing blank K cell.")
+            log("   ⚠️ No values found. Blank K cell buffered.")
 
         log(f"📈 Shard Progress: {i+1}/{loop_end} | Batch Buffer: {buffered_rows}/{BATCH_SIZE}")
 
@@ -297,8 +243,17 @@ try:
         if buffered_rows >= BATCH_SIZE:
             ok = flush_batch()
 
-            # Most important fix: after batch complete, restart browser
+            # FULL FRESH START FOR NEXT BATCH
             restart_driver()
+            try:
+                sheet_main, sheet_data = connect_sheets()
+                company_list = sheet_main.col_values(1)
+                url_d_list = sheet_main.col_values(4)
+                url_h_list = sheet_main.col_values(8)
+                log("✅ Fresh start ready for next batch.")
+            except Exception as e:
+                log(f"❌ Failed to reconnect sheets after batch: {e}")
+                break
 
             if not ok:
                 log("❌ Batch upload failed after retries.")
@@ -309,9 +264,5 @@ try:
 finally:
     if batch_list:
         flush_batch()
-    if driver:
-        try:
-            driver.quit()
-        except:
-            pass
+    restart_driver()
     log("🏁 Shard Completed.")
