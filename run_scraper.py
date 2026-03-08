@@ -39,8 +39,11 @@ CHROME_DRIVER_PATH = ChromeDriverManager().install()
 # ---------------- SETTINGS ---------------- #
 BATCH_SIZE = 50
 RESTART_EVERY_ROWS = 15
-MIN_EXPECTED_VALUES = 10
-MAX_EXPECTED_VALUES = 40
+
+EXPECTED_COUNTS = {
+    "DAILY": 20,
+    "HOURLY": 12
+}
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
@@ -133,7 +136,7 @@ def get_visible_value_elements(drv):
 
     return values
 
-def stable_read_values(drv, pause=1.5):
+def stable_read_values(drv, pause=1.2):
     first = get_visible_value_elements(drv)
     time.sleep(pause)
     second = get_visible_value_elements(drv)
@@ -141,37 +144,61 @@ def stable_read_values(drv, pause=1.5):
     if first == second and first:
         return first
 
-    if len(second) >= len(first):
-        return second
-    return first
-
-def is_suspicious(values):
-    if not values:
-        return True
-    if len(values) < MIN_EXPECTED_VALUES:
-        return True
-    if len(values) > MAX_EXPECTED_VALUES:
-        return True
-    return False
+    return second if len(second) >= len(first) else first
 
 def bs4_fallback_values(drv):
     try:
         soup = BeautifulSoup(drv.page_source, "html.parser")
         raw_values = soup.find_all("div", class_=lambda x: x and "valueValue" in x)
-        cleaned = []
+        out = []
         for el in raw_values:
             txt = el.get_text(strip=True)
             if txt:
-                cleaned.append(txt)
-        return cleaned
+                out.append(txt)
+        return out
     except:
         return []
+
+def has_bad_count(values, url_type):
+    expected = EXPECTED_COUNTS.get(url_type)
+    return len(values) != expected
+
+def looks_like_polluted_values(values, url_type):
+    if not values:
+        return True
+
+    # DAILY correct values usually should not begin with raw OHLC/header style values
+    # Example polluted: 16.85, 16.91, 15.82, 16.02, ∅, -0.52(-3.14%), 110.49K
+    joined = " | ".join(values[:8])
+
+    suspicious_tokens = ["%", "K", "M", "B", "∅"]
+    suspicious_score = sum(1 for tok in suspicious_tokens if tok in joined)
+
+    # only use this as extra safety, not as main rule
+    if suspicious_score >= 2:
+        return True
+
+    return False
+
+def validate_values(values, url_type):
+    if not values:
+        return False
+
+    if has_bad_count(values, url_type):
+        return False
+
+    # Extra protection mainly for polluted daily pages
+    if url_type == "DAILY" and looks_like_polluted_values(values, url_type):
+        return False
+
+    return True
 
 # ---------------- SCRAPER ---------------- #
 def scrape_tradingview(url, url_type=""):
     if not url:
         return []
 
+    expected = EXPECTED_COUNTS.get(url_type, "unknown")
     log(f"   📡 Navigating {url_type}: {url}")
 
     for attempt in range(3):
@@ -183,7 +210,7 @@ def scrape_tradingview(url, url_type=""):
 
             try:
                 WebDriverWait(drv, 20).until(
-                    lambda d: len(get_visible_value_elements(d)) >= MIN_EXPECTED_VALUES
+                    lambda d: len(get_visible_value_elements(d)) >= expected
                 )
             except TimeoutException:
                 log(f"   ⚠️ {url_type} initial wait timeout, trying anyway...")
@@ -193,29 +220,27 @@ def scrape_tradingview(url, url_type=""):
             drv.execute_script("window.scrollTo(0, 0);")
             time.sleep(2)
 
-            final_values = stable_read_values(drv, pause=1.5)
+            final_values = stable_read_values(drv, pause=1.2)
 
-            if not final_values:
-                final_values = bs4_fallback_values(drv)
-
-            if is_suspicious(final_values):
-                log(f"   ⚠️ Suspicious {url_type} data on attempt {attempt+1}: count={len(final_values)} preview={final_values[:8]}")
+            if not validate_values(final_values, url_type):
+                log(f"   ⚠️ {url_type} invalid count or polluted data on attempt {attempt+1}: count={len(final_values)} preview={final_values[:8]}")
                 try:
                     drv.refresh()
                     time.sleep(4)
                     wait_for_page_ready(drv, timeout=20)
                     final_values = stable_read_values(drv, pause=1.2)
-                    if not final_values:
-                        final_values = bs4_fallback_values(drv)
                 except Exception as re:
                     log(f"   ⚠️ Refresh issue for {url_type}: {str(re)[:80]}")
 
-            if final_values and not is_suspicious(final_values):
-                log(f"   📊 Found {len(final_values)} values for {url_type}")
+            if not validate_values(final_values, url_type):
+                final_values = bs4_fallback_values(drv)
+
+            if validate_values(final_values, url_type):
+                log(f"   📊 Found {len(final_values)} correct values for {url_type}")
                 log(f"   📝 Data Preview: {final_values[:8]}...")
                 return final_values
 
-            log(f"   ⚠️ {url_type} No reliable values found on attempt {attempt+1}")
+            log(f"   ⚠️ {url_type} invalid data on attempt {attempt+1}. Expected exactly {expected}, got {len(final_values)}")
 
         except Exception as e:
             log(f"   ❌ {url_type} ERROR: {str(e)[:120]}")
@@ -291,7 +316,7 @@ try:
         vals_d = scrape_tradingview(u_d, "DAILY") if u_d else []
         vals_h = scrape_tradingview(u_h, "HOURLY") if u_h else []
 
-        # duplicate stale-data protection
+        # repeated stale data protection
         if vals_d == prev_daily and vals_h == prev_hourly and (vals_d or vals_h):
             same_count += 1
             log(f"   ⚠️ Same data repeated for consecutive symbol. Count={same_count}")
@@ -317,6 +342,11 @@ try:
 
         buffered_rows += 1
 
+        if len(vals_d) == 20 and len(vals_h) == 12:
+            log("   ✅ Correct count: DAILY=20, HOURLY=12")
+        else:
+            log(f"   ⚠️ Count mismatch saved: DAILY={len(vals_d)}, HOURLY={len(vals_h)}")
+
         if combined:
             log(f"   📥 Buffered {len(combined)} values into batch.")
         else:
@@ -327,7 +357,6 @@ try:
         with open(checkpoint_file, "w") as f:
             f.write(str(i + 1))
 
-        # browser restart every few rows for freshness
         processed_in_this_run = (i - last_i + 1)
         if processed_in_this_run % RESTART_EVERY_ROWS == 0:
             log(f"♻️ Periodic browser restart after {processed_in_this_run} processed rows.")
