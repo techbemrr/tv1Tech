@@ -32,7 +32,7 @@ CREDENTIALS_FILE = "credentials.json"
 COOKIE_FILE = "cookies.json"
 
 EXPECTED_COUNT = 20
-BATCH_SIZE = 50
+BATCH_SIZE = 5
 RESTART_EVERY_ROWS = 15
 
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
