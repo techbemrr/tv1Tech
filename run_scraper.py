@@ -3,14 +3,12 @@ import os
 import time
 import json
 import random
-import traceback
 from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import TimeoutException
 import gspread
 from google.oauth2.service_account import Credentials
 from webdriver_manager.chrome import ChromeDriverManager
@@ -32,9 +30,7 @@ EXPECTED_COUNT = 20
 BATCH_SIZE = 5
 RESTART_EVERY_ROWS = 15
 
-# Source Spreadsheet
 SOURCE_SHEET_NAME = "Stock List"
-# Destination Spreadsheet
 DEST_SPREADSHEET_ID = "1NYqFa7KEyHCLivd86RJNT9cZN0SIZeARgEH6BgW25yk"
 DEST_WORKSHEET_NAME = "Sheet1" 
 
@@ -49,52 +45,37 @@ if os.path.exists(checkpoint_file):
 else:
     last_i = START_ROW
 
-# ---------------- GOOGLE AUTH & SAFE CALLS ---------------- #
+# ---------------- GOOGLE AUTH ---------------- #
 def get_gc():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    if not os.path.exists(CREDENTIALS_FILE):
-        log(f"❌ CRITICAL: {CREDENTIALS_FILE} not found.")
-        sys.exit(1)
-    
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    log(f"🔑 Auth Email: {creds.service_account_email}")
     return gspread.authorize(creds)
 
 def safe_call(func, *args, **kwargs):
-    """Retries with full traceback logging if an error occurs."""
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            err_str = str(e)
-            if not err_str:
-                # If error is empty, get the technical type
-                err_str = f"Technical Error: {type(e).__name__}"
-            
-            log(f"⚠️ Attempt {attempt+1} failed: {err_str}")
-            
-            if "429" in err_str or "quota" in err_str:
-                time.sleep(30)
-            elif "Permission denied" in err_str or "403" in err_str:
-                log("❌ PERMISSION DENIED: You must share the sheet with the Service Account email.")
+            err = str(e).lower()
+            if "429" in err or "quota" in err:
+                wait = (attempt + 1) * 20
+                log(f"⚠️ Quota reached. Sleeping {wait}s...")
+                time.sleep(wait)
+            elif "permission" in err or "403" in err:
+                log("❌ PERMISSION DENIED: Share the sheet with the Service Account email as EDITOR.")
                 sys.exit(1)
             else:
-                # Print full traceback for the first error to see what's happening
-                if attempt == 0:
-                    traceback.print_exc()
+                log(f"⚠️ API Error: {err[:100]}")
                 time.sleep(10)
-    raise Exception("Operation failed after retries.")
+    raise Exception("API failure after retries.")
 
 def connect_sheets():
-    log(f"📊 Connecting to ID: {DEST_SPREADSHEET_ID}")
     gc = get_gc()
-    # 1. Open Source
     ws_main = safe_call(gc.open, SOURCE_SHEET_NAME).worksheet("Sheet1")
-    # 2. Open Destination
     ws_data = safe_call(gc.open_by_key, DEST_SPREADSHEET_ID).worksheet(DEST_WORKSHEET_NAME)
     return ws_main, ws_data
 
-# ---------------- BROWSER & SCRAPER ---------------- #
+# ---------------- SCRAPER ---------------- #
 driver = None
 
 def create_driver():
@@ -107,18 +88,14 @@ def create_driver():
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     return webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
 
-def ensure_driver():
-    global driver
-    if driver is None: driver = create_driver()
-    return driver
-
 def scrape_day(url):
     if not url: return []
+    global driver
+    if not driver: driver = create_driver()
     try:
-        drv = ensure_driver()
-        drv.get(url)
+        driver.get(url)
         time.sleep(5)
-        vals = drv.execute_script("""
+        vals = driver.execute_script("""
             return Array.from(document.querySelectorAll("div[class*='valueValue']"))
                 .map(el => el.innerText.strip())
                 .filter(txt => txt && !txt.includes('%') && !/[KMB]$/i.test(txt));
@@ -130,13 +107,12 @@ def scrape_day(url):
 # ---------------- MAIN ---------------- #
 try:
     ws_main, ws_data = connect_sheets()
-    log("📥 Reading columns...")
+    log("📥 Reading source data...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
-    log(f"✅ Ready. Row {last_i + 1}")
+    log(f"✅ Connection successful. Starting Row {last_i + 1}")
 except Exception as e:
-    log(f"❌ Startup Error: {e}")
-    traceback.print_exc()
+    log(f"❌ Initial Setup Failed: {e}")
     sys.exit(1)
 
 batch_list = []
