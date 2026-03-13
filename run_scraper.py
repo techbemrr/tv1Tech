@@ -15,11 +15,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 from webdriver_manager.chrome import ChromeDriverManager
 
-
 def log(msg):
     t = time.strftime("%H:%M:%S")
     print(f"[{t}] {msg}", flush=True)
-
 
 # ---------------- CONFIG ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
@@ -35,9 +33,13 @@ EXPECTED_COUNT = 20
 BATCH_SIZE = 5
 RESTART_EVERY_ROWS = 15
 
+# --- TARGET SPREADSHEET SETTINGS ---
+SOURCE_SHEET_NAME = "Stock List"
+DEST_SHEET_NAME = "MV2 DAY"  # Updated to MV2 DAY
+DEST_WORKSHEET_NAME = "Sheet1" # Updated to Sheet1
+
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-# Load checkpoint
 if os.path.exists(checkpoint_file):
     try:
         last_i = max(int(open(checkpoint_file).read().strip()), START_ROW)
@@ -46,50 +48,38 @@ if os.path.exists(checkpoint_file):
 else:
     last_i = START_ROW
 
-
 # ---------------- AUTH & API HELPERS ---------------- #
 def get_gc():
-    """Returns a stateless gspread client to avoid PermissionError."""
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    # This method avoids writing local cache files
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     return gspread.authorize(creds)
 
-
 def safe_call(func, *args, **kwargs):
-    """Retries Google Sheet calls with exponential backoff on Quota or Permission errors."""
     for attempt in range(6):
         try:
             return func(*args, **kwargs)
         except Exception as e:
             err = str(e).lower()
-            # Catch Quota (429) and local PermissionError
             if "429" in err or "quota" in err or "permission" in err:
-                wait_time = (2 ** attempt) * 10 + random.uniform(1, 5)
-                log(f"⚠️ API/Permission Issue. Retrying in {wait_time:.1f}s... ({attempt+1}/6)")
+                wait_time = (2 ** attempt) * 10 + random.uniform(2, 5)
+                log(f"⚠️ API Buffer: Retrying in {wait_time:.1f}s... ({attempt+1}/6)")
                 time.sleep(wait_time)
             else:
                 raise e
     raise Exception("Max retries reached for Google Sheets API.")
 
-
 def connect_sheets():
-    log("📊 Connecting to Google Sheets...")
+    log(f"📊 Connecting to {DEST_SHEET_NAME}...")
     gc = get_gc()
-    sheet_main = safe_call(gc.open, "Stock List")
-    sheet_data = safe_call(gc.open, "MV2 for SQL")
-    return sheet_main.worksheet("Sheet1"), sheet_data.worksheet("Sheet2")
+    sheet_main = safe_call(gc.open, SOURCE_SHEET_NAME)
+    sheet_data = safe_call(gc.open, DEST_SHEET_NAME) # Opens MV2 DAY
+    return sheet_main.worksheet("Sheet1"), sheet_data.worksheet(DEST_WORKSHEET_NAME)
 
-
-# ---------------- BROWSER ---------------- #
+# ---------------- BROWSER & SCRAPER ---------------- #
 driver = None
 
-
 def create_driver():
-    log(f"🌐 [DAY] [Shard {SHARD_INDEX}] Initializing browser...")
+    log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -98,83 +88,55 @@ def create_driver():
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--incognito")
-    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     drv.set_page_load_timeout(90)
-
-    if os.path.exists(COOKIE_FILE):
-        try:
-            drv.get("https://in.tradingview.com/")
-            time.sleep(2)
-            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-                cookies = json.load(f)
-            for c in cookies:
-                try:
-                    drv.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
-                except: continue
-            drv.refresh()
-            log("✅ Cookies applied.")
-        except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:100]}")
     return drv
-
 
 def ensure_driver():
     global driver
     if driver is None: driver = create_driver()
     return driver
 
-
 def restart_driver():
     global driver
     try:
-        if driver:
-            log("♻️ Closing browser...")
-            driver.quit()
+        if driver: driver.quit()
     except: pass
     driver = None
     time.sleep(2)
 
-
-# ---------------- SCRAPER HELPERS ---------------- #
 def get_visible_value_elements(drv):
     elems = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
     return [el.text.strip() for el in elems if el.is_displayed() and el.text.strip()]
 
-
 def scrape_day(url):
     if not url: return []
-    log(f"    📡 Navigating DAY: {url}")
+    log(f"    📡 Navigating: {url}")
     for attempt in range(2):
         try:
             drv = ensure_driver()
             drv.get(url)
             WebDriverWait(drv, 20).until(lambda d: len(get_visible_value_elements(d)) >= EXPECTED_COUNT)
             time.sleep(2)
-            drv.execute_script("window.scrollTo(0, 300);")
-            time.sleep(1.5)
             values = get_visible_value_elements(drv)
             if len(values) >= EXPECTED_COUNT:
                 return values[:EXPECTED_COUNT]
         except Exception as e:
-            log(f"    ❌ Scrape attempt {attempt+1} error: {str(e)[:80]}")
+            log(f"    ❌ Scrape error: {str(e)[:50]}")
             restart_driver()
     return []
 
-
-# ---------------- MAIN LOOP ---------------- #
+# ---------------- MAIN EXECUTION ---------------- #
 try:
     ws_main, ws_data = connect_sheets()
-    # Minimize read requests by pre-fetching columns
     log("📥 Pre-fetching source data...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
-    log(f"✅ Setup Ready. Row {last_i + 1}")
+    log(f"✅ Setup Ready. Starting Row {last_i + 1}")
 except Exception as e:
-    log(f"❌ Initial Connection Error: {e}")
+    log(f"❌ Connection Error: {e}")
     sys.exit(1)
 
 batch_list = []
@@ -184,7 +146,7 @@ current_date = date.today().strftime("%m/%d/%Y")
 def flush_batch():
     global batch_list, buffered_rows, ws_data
     if not batch_list: return True
-    log(f"🚀 UPLOADING BATCH: {buffered_rows} rows...")
+    log(f"🚀 UPLOADING BATCH TO {DEST_SHEET_NAME}: {buffered_rows} rows...")
     try:
         safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
         log("✅ Batch written successfully.")
@@ -210,6 +172,7 @@ try:
         batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [[]]})
         buffered_rows += 1
 
+        # Checkpoint
         with open(checkpoint_file, "w") as f: f.write(str(i + 1))
 
         if (i - last_i + 1) % RESTART_EVERY_ROWS == 0:
@@ -218,7 +181,7 @@ try:
         if buffered_rows >= BATCH_SIZE:
             if not flush_batch(): break
             restart_driver()
-            # Refresh connections to keep token fresh
+            # Refresh connection and pre-fetch again for the next chunk
             ws_main, ws_data = connect_sheets()
             company_list = safe_call(ws_main.col_values, 1)
             url_day_list = safe_call(ws_main.col_values, 4)
@@ -226,4 +189,4 @@ try:
 finally:
     if batch_list: flush_batch()
     restart_driver()
-    log("🏁 Shard Completed.")
+    log("🏁 DAY Shard Completed.")
