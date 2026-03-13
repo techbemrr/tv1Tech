@@ -30,11 +30,24 @@ END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
 EXPECTED_COUNT = 20
-BATCH_SIZE = 100
+BATCH_SIZE = 10
 RESTART_EVERY_ROWS = 15
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
+
+# SOURCE SHEET (READ FROM HERE)
+SOURCE_SPREADSHEET_NAME = "Stock List"
+SOURCE_WORKSHEET_NAME = "Sheet1"
+
+# DESTINATION SHEET (WRITE HERE)
+DEST_SPREADSHEET_ID = "1NYqFa7KEyHCLivd86RJNT9cZN0SIZeARgEH6BgW25yk"
+DEST_WORKSHEET_NAME = "Sheet1"
+
+# WRITE COLUMNS
+WRITE_NAME_COL = "A"
+WRITE_DATE_COL = "B"
+WRITE_VALUE_START_COL = "C"
 
 # Small stagger so multiple files don't hit Sheets at same instant
 startup_delay = SHARD_INDEX * 3 + random.uniform(1, 4)
@@ -252,9 +265,15 @@ def safe_connect_sheets(max_retries=5):
         try:
             log("📊 Connecting to Google Sheets...")
             gc = gspread.service_account("credentials.json")
-            sheet_main = gc.open("Stock List").worksheet("Sheet1")
-            sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
+
+            # Read sheet
+            sheet_main = gc.open(SOURCE_SPREADSHEET_NAME).worksheet(SOURCE_WORKSHEET_NAME)
+
+            # Write sheet
+            sheet_data = gc.open_by_key(DEST_SPREADSHEET_ID).worksheet(DEST_WORKSHEET_NAME)
+
             return sheet_main, sheet_data
+
         except Exception as e:
             wait = (2 ** attempt) + random.uniform(1, 3)
             log(f"⚠️ Sheets connect retry {attempt+1}: {str(e)[:120]} | sleeping {wait:.1f}s")
@@ -266,7 +285,7 @@ def safe_connect_sheets(max_retries=5):
 try:
     sheet_main, sheet_data = safe_connect_sheets()
 
-    # Single read request instead of separate full column reads
+    # Read source data only once
     all_rows = sheet_main.get(f"A1:D{END_ROW}")
 
     company_list = []
@@ -344,9 +363,11 @@ try:
         prev_day = vals_day.copy() if vals_day else []
 
         row_idx = i + 1
-        batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
-        batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
-        batch_list.append({"range": f"K{row_idx}", "values": [vals_day] if vals_day else [[]]})
+
+        # Writing starts from first column
+        batch_list.append({"range": f"{WRITE_NAME_COL}{row_idx}", "values": [[name]]})
+        batch_list.append({"range": f"{WRITE_DATE_COL}{row_idx}", "values": [[current_date]]})
+        batch_list.append({"range": f"{WRITE_VALUE_START_COL}{row_idx}", "values": [vals_day] if vals_day else [[]]})
 
         buffered_rows += 1
 
@@ -355,7 +376,7 @@ try:
         else:
             log(f"   ⚠️ DAY count mismatch: {len(vals_day)}")
 
-        log(f"   📥 Buffered {len(vals_day)} DAY values starting from K.")
+        log(f"   📥 Buffered {len(vals_day)} DAY values starting from {WRITE_VALUE_START_COL}.")
         log(f"📈 DAY Progress: {i+1}/{loop_end} | Batch Buffer: {buffered_rows}/{BATCH_SIZE}")
 
         with open(checkpoint_file, "w") as f:
