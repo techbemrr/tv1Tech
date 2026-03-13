@@ -9,6 +9,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import gspread
 from google.oauth2.service_account import Credentials
 from webdriver_manager.chrome import ChromeDriverManager
@@ -23,6 +24,9 @@ SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 
+# TO START FROM THE BEGINNING: We ignore the checkpoint if you want a fresh start
+START_FROM_SCRATCH = True 
+
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 CREDENTIALS_FILE = "credentials.json"
 
@@ -36,7 +40,7 @@ DEST_WORKSHEET_NAME = "Sheet1"
 
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-if os.path.exists(checkpoint_file):
+if not START_FROM_SCRATCH and os.path.exists(checkpoint_file):
     try:
         with open(checkpoint_file, "r") as f:
             last_i = max(int(f.read().strip()), START_ROW)
@@ -85,6 +89,7 @@ def create_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     return webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
 
@@ -92,16 +97,36 @@ def scrape_day(url):
     if not url: return []
     global driver
     if not driver: driver = create_driver()
+    
     try:
         driver.get(url)
-        time.sleep(5)
+        # Wait for the technical analysis table values to actually load
+        wait = WebDriverWait(driver, 30)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
+        
+        # Give it a moment to stabilize
+        time.sleep(4)
+        
+        # Improved Extraction: Gets all text from the value cells
         vals = driver.execute_script("""
             return Array.from(document.querySelectorAll("div[class*='valueValue']"))
                 .map(el => el.innerText.strip())
-                .filter(txt => txt && !txt.includes('%') && !/[KMB]$/i.test(txt));
+                .filter(txt => txt !== "");
         """)
+        
+        if len(vals) < EXPECTED_COUNT:
+            # Fallback: Scroll a bit to trigger lazy loading if needed
+            driver.execute_script("window.scrollTo(0, 400);")
+            time.sleep(2)
+            vals = driver.execute_script("""
+                return Array.from(document.querySelectorAll("div[class*='valueValue']"))
+                    .map(el => el.innerText.strip())
+                    .filter(txt => txt !== "");
+            """)
+
         return vals[:EXPECTED_COUNT] if vals else []
-    except:
+    except Exception as e:
+        log(f"    ⚠️ Scrape failed: {str(e)[:50]}")
         return []
 
 # ---------------- MAIN ---------------- #
@@ -110,7 +135,7 @@ try:
     log("📥 Reading source data...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
-    log(f"✅ Connection successful. Starting Row {last_i + 1}")
+    log(f"✅ Starting from Row {last_i + 1}")
 except Exception as e:
     log(f"❌ Initial Setup Failed: {e}")
     sys.exit(1)
@@ -127,13 +152,19 @@ try:
         log(f"--- [ROW {i+1}] {name} ---")
         vals = scrape_day(u_day)
         
+        if not vals:
+            log("    ❌ No data found for this symbol.")
+        else:
+            log(f"    📊 Found {len(vals)} values.")
+
         row_idx = i + 1
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
-        batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [[]]})
+        # If vals is empty, we send an empty list so it doesn't shift columns
+        batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [["N/A"] * EXPECTED_COUNT]})
 
         if len(batch_list) // 3 >= BATCH_SIZE:
-            log(f"🚀 Uploading Batch...")
+            log(f"🚀 Uploading Batch ({BATCH_SIZE} rows)...")
             safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
             batch_list = []
             with open(checkpoint_file, "w") as f: f.write(str(i + 1))
