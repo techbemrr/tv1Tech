@@ -24,7 +24,7 @@ SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 
-# TO START FROM THE BEGINNING: We ignore the checkpoint if you want a fresh start
+# Always starts from the first row of your list
 START_FROM_SCRATCH = True 
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
@@ -34,6 +34,7 @@ EXPECTED_COUNT = 20
 BATCH_SIZE = 5
 RESTART_EVERY_ROWS = 15
 
+# --- UPDATED LOCATIONS ---
 SOURCE_SHEET_NAME = "Stock List"
 DEST_SPREADSHEET_ID = "1NYqFa7KEyHCLivd86RJNT9cZN0SIZeARgEH6BgW25yk"
 DEST_WORKSHEET_NAME = "Sheet1" 
@@ -52,6 +53,9 @@ else:
 # ---------------- GOOGLE AUTH ---------------- #
 def get_gc():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    if not os.path.exists(CREDENTIALS_FILE):
+        log(f"❌ CRITICAL: {CREDENTIALS_FILE} not found.")
+        sys.exit(1)
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -61,17 +65,17 @@ def safe_call(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             err = str(e).lower()
-            if "429" in err or "quota" in err:
+            if "429" in err or "quota" in err or "200" in err:
                 wait = (attempt + 1) * 20
-                log(f"⚠️ Quota reached. Sleeping {wait}s...")
+                log(f"⚠️ API issue. Waiting {wait}s...")
                 time.sleep(wait)
             elif "permission" in err or "403" in err:
                 log("❌ PERMISSION DENIED: Share the sheet with the Service Account email as EDITOR.")
                 sys.exit(1)
             else:
-                log(f"⚠️ API Error: {err[:100]}")
+                log(f"⚠️ Error: {err[:100]}")
                 time.sleep(10)
-    raise Exception("API failure after retries.")
+    raise Exception("API failure after multiple retries.")
 
 def connect_sheets():
     gc = get_gc()
@@ -89,7 +93,7 @@ def create_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
+    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     return webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
 
@@ -100,44 +104,32 @@ def scrape_day(url):
     
     try:
         driver.get(url)
-        # Wait for the technical analysis table values to actually load
-        wait = WebDriverWait(driver, 30)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
+        # Wait specifically for the data values to appear
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']"))
+        )
+        time.sleep(5) # Stabilization time
         
-        # Give it a moment to stabilize
-        time.sleep(4)
-        
-        # Improved Extraction: Gets all text from the value cells
+        # JS extraction ensures we get text hidden or lazy-loaded
         vals = driver.execute_script("""
             return Array.from(document.querySelectorAll("div[class*='valueValue']"))
                 .map(el => el.innerText.strip())
                 .filter(txt => txt !== "");
         """)
-        
-        if len(vals) < EXPECTED_COUNT:
-            # Fallback: Scroll a bit to trigger lazy loading if needed
-            driver.execute_script("window.scrollTo(0, 400);")
-            time.sleep(2)
-            vals = driver.execute_script("""
-                return Array.from(document.querySelectorAll("div[class*='valueValue']"))
-                    .map(el => el.innerText.strip())
-                    .filter(txt => txt !== "");
-            """)
-
         return vals[:EXPECTED_COUNT] if vals else []
     except Exception as e:
-        log(f"    ⚠️ Scrape failed: {str(e)[:50]}")
+        log(f"    ⚠️ Scrape error: {str(e)[:50]}")
         return []
 
 # ---------------- MAIN ---------------- #
 try:
     ws_main, ws_data = connect_sheets()
-    log("📥 Reading source data...")
+    log("📥 Pre-fetching source data...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
-    log(f"✅ Starting from Row {last_i + 1}")
+    log(f"✅ Ready. Starting at Row {last_i + 1}")
 except Exception as e:
-    log(f"❌ Initial Setup Failed: {e}")
+    log(f"❌ Connection Error: {e}")
     sys.exit(1)
 
 batch_list = []
@@ -149,33 +141,33 @@ try:
         name = company_list[i].strip()
         u_day = url_day_list[i].strip() if i < len(url_day_list) and url_day_list[i].startswith("http") else None
         
-        log(f"--- [ROW {i+1}] {name} ---")
+        log(f"--- [ROW {i+1}] Processing: {name} ---")
         vals = scrape_day(u_day)
         
-        if not vals:
-            log("    ❌ No data found for this symbol.")
-        else:
-            log(f"    📊 Found {len(vals)} values.")
-
         row_idx = i + 1
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
-        # If vals is empty, we send an empty list so it doesn't shift columns
         batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [["N/A"] * EXPECTED_COUNT]})
 
-        if len(batch_list) // 3 >= BATCH_SIZE:
-            log(f"🚀 Uploading Batch ({BATCH_SIZE} rows)...")
-            safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
-            batch_list = []
-            with open(checkpoint_file, "w") as f: f.write(str(i + 1))
-            
-        if (i + 1) % RESTART_EVERY_ROWS == 0:
+        # Checkpoint
+        with open(checkpoint_file, "w") as f: f.write(str(i + 1))
+
+        if (i - last_i + 1) % RESTART_EVERY_ROWS == 0:
             if driver: driver.quit()
             driver = None
+
+        if len(batch_list) // 3 >= BATCH_SIZE:
+            log(f"🚀 UPLOADING BATCH to {DEST_WORKSHEET_NAME}...")
+            safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
+            batch_list = []
+            if driver: driver.quit()
+            driver = None
+            # Refresh connection for next chunk
+            ws_main, ws_data = connect_sheets()
 
 finally:
     if batch_list:
         try: safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
         except: pass
     if driver: driver.quit()
-    log("🏁 Shard Completed.")
+    log("🏁 DAY Shard Completed.")
