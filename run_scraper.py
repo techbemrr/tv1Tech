@@ -28,7 +28,7 @@ checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------------- SETTINGS ---------------- #
-BATCH_SIZE = 50
+BATCH_SIZE = 5
 RESTART_EVERY_ROWS = 15
 EXPECTED_COUNTS = {"DAILY": 20, "HOURLY": 12}
 CREDENTIALS_FILE = "credentials.json"
