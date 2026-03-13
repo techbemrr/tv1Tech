@@ -31,8 +31,11 @@ EXPECTED_COUNT = 20
 BATCH_SIZE = 50
 RESTART_EVERY_ROWS = 15
 
+# Source Spreadsheet
 SOURCE_SHEET_NAME = "Stock List"
-DEST_SHEET_NAME = "MV2 DAY"  
+
+# Destination Spreadsheet (MV2 DAY)
+DEST_SPREADSHEET_ID = "1NYqFa7KEyHCLivd86RJNT9cZN0SIZeARgEH6BgW25yk"
 DEST_WORKSHEET_NAME = "Sheet1" 
 
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
@@ -46,42 +49,39 @@ if os.path.exists(checkpoint_file):
 else:
     last_i = START_ROW
 
-# ---------------- GOOGLE AUTH & DEBUGGING ---------------- #
+# ---------------- GOOGLE AUTH & SAFE CALLS ---------------- #
 def get_gc():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     if not os.path.exists(CREDENTIALS_FILE):
-        log(f"❌ CRITICAL: {CREDENTIALS_FILE} not found in {os.getcwd()}")
+        log(f"❌ CRITICAL: {CREDENTIALS_FILE} not found.")
         sys.exit(1)
     
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    log(f"🔑 Authenticated as: {creds.service_account_email}")
     return gspread.authorize(creds)
 
 def safe_call(func, *args, **kwargs):
-    """Retries but prints EXACT error messages for debugging."""
+    """Retries with exponential backoff for API stability."""
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
-        except gspread.exceptions.SpreadsheetNotFound:
-            log(f"❌ ERROR: Spreadsheet '{args[0]}' not found! Check the name or Share permissions.")
-            sys.exit(1)
         except Exception as e:
             err_str = str(e)
-            if "429" in err_str or "quota" in err_str:
-                wait_time = (attempt + 1) * 20
-                log(f"⚠️ Quota Limit. Waiting {wait_time}s...")
+            if "429" in err_str or "quota" in err_str or "200" in err_str:
+                wait_time = (attempt + 1) * 15
+                log(f"⚠️ API/Connection issue. Waiting {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                log(f"⚠️ API Error Detail: {err_str[:200]}")
-                time.sleep(10)
-    raise Exception("Failed after multiple retries.")
+                log(f"⚠️ Error: {err_str[:150]}")
+                time.sleep(5)
+    raise Exception("Operation failed after multiple retries.")
 
 def connect_sheets():
-    log(f"📊 Attempting to open: {DEST_SHEET_NAME}")
+    log(f"📊 Connecting to Spreadsheet ID: {DEST_SPREADSHEET_ID}")
     gc = get_gc()
-    # Explicitly check for both sheets
+    # Open Source by Name
     ws_main = safe_call(gc.open, SOURCE_SHEET_NAME).worksheet("Sheet1")
-    ws_data = safe_call(gc.open, DEST_SHEET_NAME).worksheet(DEST_WORKSHEET_NAME)
+    # Open Destination by ID to ensure accuracy
+    ws_data = safe_call(gc.open_by_key, DEST_SPREADSHEET_ID).worksheet(DEST_WORKSHEET_NAME)
     return ws_main, ws_data
 
 # ---------------- BROWSER & SCRAPER ---------------- #
@@ -95,8 +95,7 @@ def create_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-    drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    return drv
+    return webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
 
 def ensure_driver():
     global driver
@@ -109,7 +108,6 @@ def scrape_day(url):
         drv = ensure_driver()
         drv.get(url)
         time.sleep(5)
-        # Fast JS extraction
         vals = drv.execute_script("""
             return Array.from(document.querySelectorAll("div[class*='valueValue']"))
                 .map(el => el.innerText.strip())
@@ -122,7 +120,7 @@ def scrape_day(url):
 # ---------------- MAIN ---------------- #
 try:
     ws_main, ws_data = connect_sheets()
-    log("📥 Pre-fetching data...")
+    log("📥 Pre-fetching source columns...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
     log(f"✅ Ready. Row {last_i + 1}")
@@ -143,12 +141,13 @@ try:
         vals = scrape_day(u_day)
         
         row_idx = i + 1
+        # Mapping to Sheet1 of MV2 DAY
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
         batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [[]]})
 
         if len(batch_list) // 3 >= BATCH_SIZE:
-            log(f"🚀 Flushing {BATCH_SIZE} rows...")
+            log(f"🚀 Uploading {BATCH_SIZE} rows...")
             safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
             batch_list = []
             with open(checkpoint_file, "w") as f: f.write(str(i + 1))
