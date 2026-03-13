@@ -29,7 +29,7 @@ checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.tx
 CREDENTIALS_FILE = "credentials.json"
 
 EXPECTED_COUNT = 20
-BATCH_SIZE = 50
+BATCH_SIZE = 5
 RESTART_EVERY_ROWS = 15
 
 # Source Spreadsheet
