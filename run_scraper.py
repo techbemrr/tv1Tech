@@ -24,12 +24,11 @@ SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 
-# Use the environment variable for checkpoint if provided
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 CREDENTIALS_FILE = "credentials.json"
 
 EXPECTED_COUNT = 20
-BATCH_SIZE = 5
+BATCH_SIZE = 50
 RESTART_EVERY_ROWS = 15
 
 SOURCE_SHEET_NAME = "Stock List"
@@ -38,7 +37,6 @@ DEST_WORKSHEET_NAME = "Sheet1"
 
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-# Initialize last_i from checkpoint
 if os.path.exists(checkpoint_file):
     try:
         with open(checkpoint_file, "r") as f:
@@ -48,56 +46,56 @@ if os.path.exists(checkpoint_file):
 else:
     last_i = START_ROW
 
-# ---------------- GOOGLE AUTH ---------------- #
+# ---------------- GOOGLE AUTH & DEBUGGING ---------------- #
 def get_gc():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     if not os.path.exists(CREDENTIALS_FILE):
-        raise FileNotFoundError(f"Missing {CREDENTIALS_FILE}")
+        log(f"❌ CRITICAL: {CREDENTIALS_FILE} not found in {os.getcwd()}")
+        sys.exit(1)
     
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    log(f"🔑 Authenticated as: {creds.service_account_email}")
     return gspread.authorize(creds)
 
 def safe_call(func, *args, **kwargs):
-    for attempt in range(7):
+    """Retries but prints EXACT error messages for debugging."""
+    for attempt in range(5):
         try:
             return func(*args, **kwargs)
+        except gspread.exceptions.SpreadsheetNotFound:
+            log(f"❌ ERROR: Spreadsheet '{args[0]}' not found! Check the name or Share permissions.")
+            sys.exit(1)
         except Exception as e:
-            err = str(e).lower()
-            if "200" in err or "429" in err or "quota" in err or "permission" in err:
-                wait_time = (2 ** attempt) * 12 + random.uniform(2, 5)
-                log(f"⚠️ API issue, retrying in {wait_time:.1f}s...")
+            err_str = str(e)
+            if "429" in err_str or "quota" in err_str:
+                wait_time = (attempt + 1) * 20
+                log(f"⚠️ Quota Limit. Waiting {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                raise e
-    raise Exception("Max retries reached for Google Sheets.")
+                log(f"⚠️ API Error Detail: {err_str[:200]}")
+                time.sleep(10)
+    raise Exception("Failed after multiple retries.")
 
 def connect_sheets():
-    log(f"📊 Connecting to {DEST_SHEET_NAME}...")
+    log(f"📊 Attempting to open: {DEST_SHEET_NAME}")
     gc = get_gc()
-    sheet_main = safe_call(gc.open, SOURCE_SHEET_NAME)
-    sheet_data = safe_call(gc.open, DEST_SHEET_NAME) 
-    return sheet_main.worksheet("Sheet1"), sheet_data.worksheet(DEST_WORKSHEET_NAME)
+    # Explicitly check for both sheets
+    ws_main = safe_call(gc.open, SOURCE_SHEET_NAME).worksheet("Sheet1")
+    ws_data = safe_call(gc.open, DEST_SHEET_NAME).worksheet(DEST_WORKSHEET_NAME)
+    return ws_main, ws_data
 
-# ---------------- BROWSER ---------------- #
+# ---------------- BROWSER & SCRAPER ---------------- #
 driver = None
 
 def create_driver():
-    log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    drv.set_page_load_timeout(90)
     return drv
 
 def ensure_driver():
@@ -105,67 +103,35 @@ def ensure_driver():
     if driver is None: driver = create_driver()
     return driver
 
-def restart_driver():
-    global driver
-    try:
-        if driver: driver.quit()
-    except: pass
-    driver = None
-    time.sleep(2)
-
-def get_visible_value_elements(drv):
-    script = """
-    return Array.from(document.querySelectorAll("div[class*='valueValue']"))
-        .map(el => el.innerText.strip())
-        .filter(txt => txt && !txt.includes('%') && !/[KMB]$/i.test(txt));
-    """
-    try: return drv.execute_script(script)
-    except: return []
-
 def scrape_day(url):
     if not url: return []
-    log(f"    📡 Navigating: {url}")
-    for attempt in range(2):
-        try:
-            drv = ensure_driver()
-            drv.get(url)
-            WebDriverWait(drv, 25).until(lambda d: len(get_visible_value_elements(d)) > 0)
-            time.sleep(3)
-            values = get_visible_value_elements(drv)
-            if len(values) >= EXPECTED_COUNT:
-                return values[:EXPECTED_COUNT]
-        except Exception as e:
-            log(f"    ❌ Scrape error: {str(e)[:50]}")
-            restart_driver()
-    return []
+    try:
+        drv = ensure_driver()
+        drv.get(url)
+        time.sleep(5)
+        # Fast JS extraction
+        vals = drv.execute_script("""
+            return Array.from(document.querySelectorAll("div[class*='valueValue']"))
+                .map(el => el.innerText.strip())
+                .filter(txt => txt && !txt.includes('%') && !/[KMB]$/i.test(txt));
+        """)
+        return vals[:EXPECTED_COUNT] if vals else []
+    except:
+        return []
 
 # ---------------- MAIN ---------------- #
 try:
     ws_main, ws_data = connect_sheets()
-    log("📥 Pre-fetching source columns...")
+    log("📥 Pre-fetching data...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
-    log(f"✅ Ready. Starting Row {last_i + 1}")
+    log(f"✅ Ready. Row {last_i + 1}")
 except Exception as e:
-    log(f"❌ Connection Error: {e}")
+    log(f"❌ Startup Failed: {e}")
     sys.exit(1)
 
 batch_list = []
-buffered_rows = 0
 current_date = date.today().strftime("%m/%d/%Y")
-
-def flush_batch():
-    global batch_list, buffered_rows, ws_data
-    if not batch_list: return True
-    log(f"🚀 UPLOADING BATCH to {DEST_SHEET_NAME}...")
-    try:
-        safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
-        batch_list, buffered_rows = [], 0
-        log("✅ Upload complete.")
-        return True
-    except Exception as e:
-        log(f"❌ Flush failed: {e}")
-        return False
 
 try:
     loop_end = min(END_ROW, len(company_list))
@@ -180,21 +146,19 @@ try:
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
         batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [[]]})
-        buffered_rows += 1
 
-        with open(checkpoint_file, "w") as f: 
-            f.write(str(i + 1))
-
-        if (i - last_i + 1) % RESTART_EVERY_ROWS == 0:
-            restart_driver()
-
-        if buffered_rows >= BATCH_SIZE:
-            flush_batch()
-            restart_driver()
-            ws_main, ws_data = connect_sheets()
+        if len(batch_list) // 3 >= BATCH_SIZE:
+            log(f"🚀 Flushing {BATCH_SIZE} rows...")
+            safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
+            batch_list = []
+            with open(checkpoint_file, "w") as f: f.write(str(i + 1))
+            
+        if (i + 1) % RESTART_EVERY_ROWS == 0:
+            if driver: driver.quit()
+            driver = None
 
 finally:
-    if batch_list: 
-        flush_batch()
-    restart_driver()
+    if batch_list:
+        safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
+    if driver: driver.quit()
     log("🏁 Shard Completed.")
