@@ -3,6 +3,7 @@ import os
 import time
 import json
 import random
+import traceback
 from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -33,8 +34,7 @@ RESTART_EVERY_ROWS = 15
 
 # Source Spreadsheet
 SOURCE_SHEET_NAME = "Stock List"
-
-# Destination Spreadsheet (MV2 DAY)
+# Destination Spreadsheet
 DEST_SPREADSHEET_ID = "1NYqFa7KEyHCLivd86RJNT9cZN0SIZeARgEH6BgW25yk"
 DEST_WORKSHEET_NAME = "Sheet1" 
 
@@ -57,30 +57,40 @@ def get_gc():
         sys.exit(1)
     
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    log(f"🔑 Auth Email: {creds.service_account_email}")
     return gspread.authorize(creds)
 
 def safe_call(func, *args, **kwargs):
-    """Retries with exponential backoff for API stability."""
-    for attempt in range(5):
+    """Retries with full traceback logging if an error occurs."""
+    for attempt in range(4):
         try:
             return func(*args, **kwargs)
         except Exception as e:
             err_str = str(e)
-            if "429" in err_str or "quota" in err_str or "200" in err_str:
-                wait_time = (attempt + 1) * 15
-                log(f"⚠️ API/Connection issue. Waiting {wait_time}s...")
-                time.sleep(wait_time)
+            if not err_str:
+                # If error is empty, get the technical type
+                err_str = f"Technical Error: {type(e).__name__}"
+            
+            log(f"⚠️ Attempt {attempt+1} failed: {err_str}")
+            
+            if "429" in err_str or "quota" in err_str:
+                time.sleep(30)
+            elif "Permission denied" in err_str or "403" in err_str:
+                log("❌ PERMISSION DENIED: You must share the sheet with the Service Account email.")
+                sys.exit(1)
             else:
-                log(f"⚠️ Error: {err_str[:150]}")
-                time.sleep(5)
-    raise Exception("Operation failed after multiple retries.")
+                # Print full traceback for the first error to see what's happening
+                if attempt == 0:
+                    traceback.print_exc()
+                time.sleep(10)
+    raise Exception("Operation failed after retries.")
 
 def connect_sheets():
-    log(f"📊 Connecting to Spreadsheet ID: {DEST_SPREADSHEET_ID}")
+    log(f"📊 Connecting to ID: {DEST_SPREADSHEET_ID}")
     gc = get_gc()
-    # Open Source by Name
+    # 1. Open Source
     ws_main = safe_call(gc.open, SOURCE_SHEET_NAME).worksheet("Sheet1")
-    # Open Destination by ID to ensure accuracy
+    # 2. Open Destination
     ws_data = safe_call(gc.open_by_key, DEST_SPREADSHEET_ID).worksheet(DEST_WORKSHEET_NAME)
     return ws_main, ws_data
 
@@ -120,12 +130,13 @@ def scrape_day(url):
 # ---------------- MAIN ---------------- #
 try:
     ws_main, ws_data = connect_sheets()
-    log("📥 Pre-fetching source columns...")
+    log("📥 Reading columns...")
     company_list = safe_call(ws_main.col_values, 1)
     url_day_list = safe_call(ws_main.col_values, 4)
     log(f"✅ Ready. Row {last_i + 1}")
 except Exception as e:
-    log(f"❌ Startup Failed: {e}")
+    log(f"❌ Startup Error: {e}")
+    traceback.print_exc()
     sys.exit(1)
 
 batch_list = []
@@ -141,13 +152,12 @@ try:
         vals = scrape_day(u_day)
         
         row_idx = i + 1
-        # Mapping to Sheet1 of MV2 DAY
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"J{row_idx}", "values": [[current_date]]})
         batch_list.append({"range": f"K{row_idx}", "values": [vals] if vals else [[]]})
 
         if len(batch_list) // 3 >= BATCH_SIZE:
-            log(f"🚀 Uploading {BATCH_SIZE} rows...")
+            log(f"🚀 Uploading Batch...")
             safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
             batch_list = []
             with open(checkpoint_file, "w") as f: f.write(str(i + 1))
@@ -158,6 +168,7 @@ try:
 
 finally:
     if batch_list:
-        safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
+        try: safe_call(ws_data.batch_update, batch_list, value_input_option="RAW")
+        except: pass
     if driver: driver.quit()
     log("🏁 Shard Completed.")
