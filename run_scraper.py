@@ -12,6 +12,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
 from bs4 import BeautifulSoup
 import gspread
+from gspread.exceptions import APIError
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -22,45 +23,49 @@ def log(msg):
 
 # ---------------- CONFIG ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
+SHARD_SIZE = int(os.getenv("SHARD_SIZE", "102"))
 
-START_ROW = SHARD_INDEX * SHARD_SIZE
-END_ROW = START_ROW + SHARD_SIZE
+START_ROW = SHARD_INDEX * SHARD_SIZE + 1   # 1-based sheet row
+END_ROW = START_ROW + SHARD_SIZE - 1
 
-checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
+checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
 EXPECTED_COUNT = 20
-BATCH_SIZE = 10
+BATCH_SIZE = 100
 RESTART_EVERY_ROWS = 15
 
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
+CREDENTIALS_FILE = "credentials.json"
 
-# SOURCE SHEET (READ FROM HERE)
+# -------- SOURCE / DESTINATION -------- #
+# READ FROM HERE
 SOURCE_SPREADSHEET_NAME = "Stock List"
 SOURCE_WORKSHEET_NAME = "Sheet1"
 
-# DESTINATION SHEET (WRITE HERE)
+# WRITE HERE
 DEST_SPREADSHEET_ID = "1NYqFa7KEyHCLivd86RJNT9cZN0SIZeARgEH6BgW25yk"
 DEST_WORKSHEET_NAME = "Sheet1"
 
-# WRITE COLUMNS
+# Writing starts from first column
 WRITE_NAME_COL = "A"
 WRITE_DATE_COL = "B"
 WRITE_VALUE_START_COL = "C"
 
-# Small stagger so multiple files don't hit Sheets at same instant
-startup_delay = SHARD_INDEX * 3 + random.uniform(1, 4)
+# Startup jitter
+startup_delay = SHARD_INDEX * 8 + random.uniform(3, 8)
 log(f"⏳ Startup stagger delay: {startup_delay:.1f}s")
 time.sleep(startup_delay)
 
 if os.path.exists(checkpoint_file):
     try:
-        last_i = max(int(open(checkpoint_file).read().strip()), START_ROW)
+        with open(checkpoint_file, "r") as f:
+            saved = int(f.read().strip())
+        last_row = max(saved, START_ROW)
     except:
-        last_i = START_ROW
+        last_row = START_ROW
 else:
-    last_i = START_ROW
+    last_row = START_ROW
 
 
 # ---------------- DRIVER ---------------- #
@@ -68,7 +73,7 @@ driver = None
 
 
 def create_driver():
-    log(f"🌐 [DAY] [Shard {SHARD_INDEX}] Range {START_ROW+1}-{END_ROW} | Initializing browser...")
+    log(f"🌐 [DAY] [Shard {SHARD_INDEX}] Range {START_ROW}-{END_ROW} | Initializing browser...")
     opts = Options()
     opts.page_load_strategy = "normal"
 
@@ -111,7 +116,7 @@ def create_driver():
             time.sleep(2)
             log("✅ Cookies applied.")
         except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:100]}")
+            log(f"⚠️ Cookie error: {repr(e)[:120]}")
 
     return drv
 
@@ -127,10 +132,10 @@ def restart_driver():
     global driver
     try:
         if driver:
-            log("♻️ Closing DAY browser...")
+            log("♻️ Closing browser...")
             driver.quit()
     except Exception as e:
-        log(f"⚠️ Browser close issue: {str(e)[:100]}")
+        log(f"⚠️ Browser close issue: {repr(e)[:120]}")
     driver = None
     time.sleep(3)
 
@@ -203,6 +208,15 @@ def validate_day(values):
     return True
 
 
+def sleep_with_jitter(base, extra=3):
+    time.sleep(base + random.uniform(1, extra))
+
+
+def is_quota_error(exc):
+    text = repr(exc)
+    return "429" in text or "Quota exceeded" in text or "Read requests per minute per user" in text
+
+
 # ---------------- SCRAPER ---------------- #
 def scrape_day(url):
     if not url:
@@ -239,7 +253,7 @@ def scrape_day(url):
                     wait_for_page_ready(drv, timeout=20)
                     values = stable_read_values(drv, pause=1.2)
                 except Exception as e:
-                    log(f"   ⚠️ DAY refresh issue: {str(e)[:100]}")
+                    log(f"   ⚠️ DAY refresh issue: {repr(e)[:120]}")
 
             if not validate_day(values):
                 values = bs4_fallback_values(drv)
@@ -252,7 +266,7 @@ def scrape_day(url):
             log(f"   ⚠️ DAY invalid data on attempt {attempt+1}. Expected {EXPECTED_COUNT}, got {len(values)}")
 
         except Exception as e:
-            log(f"   ❌ DAY ERROR: {str(e)[:120]}")
+            log(f"   ❌ DAY ERROR: {repr(e)[:150]}")
             restart_driver()
             time.sleep(3)
 
@@ -260,44 +274,101 @@ def scrape_day(url):
 
 
 # ---------------- SHEETS ---------------- #
-def safe_connect_sheets(max_retries=5):
+def get_gc():
+    return gspread.service_account(filename=CREDENTIALS_FILE)
+
+
+def connect_source_sheet(max_retries=8):
+    """
+    Read source only once.
+    """
     for attempt in range(max_retries):
         try:
-            log("📊 Connecting to Google Sheets...")
-            gc = gspread.service_account("credentials.json")
-
-            # Read sheet
-            sheet_main = gc.open(SOURCE_SPREADSHEET_NAME).worksheet(SOURCE_WORKSHEET_NAME)
-
-            # Write sheet
-            sheet_data = gc.open_by_key(DEST_SPREADSHEET_ID).worksheet(DEST_WORKSHEET_NAME)
-
-            return sheet_main, sheet_data
+            log("📊 Connecting to SOURCE Google Sheet...")
+            gc = get_gc()
+            ws = gc.open(SOURCE_SPREADSHEET_NAME).worksheet(SOURCE_WORKSHEET_NAME)
+            return ws
 
         except Exception as e:
-            wait = (2 ** attempt) + random.uniform(1, 3)
-            log(f"⚠️ Sheets connect retry {attempt+1}: {str(e)[:120]} | sleeping {wait:.1f}s")
+            wait = min(90, (2 ** attempt) + random.uniform(4, 10))
+            log(f"⚠️ SOURCE connect retry {attempt+1}: {repr(e)[:180]} | sleeping {wait:.1f}s")
             time.sleep(wait)
 
-    raise Exception("Failed to connect to Google Sheets after retries")
+    raise Exception("Failed to connect to SOURCE sheet after retries")
+
+
+def connect_dest_sheet(max_retries=8):
+    """
+    Writer connection only.
+    """
+    for attempt in range(max_retries):
+        try:
+            log("📊 Connecting to DEST Google Sheet...")
+            gc = get_gc()
+            ws = gc.open_by_key(DEST_SPREADSHEET_ID).worksheet(DEST_WORKSHEET_NAME)
+            return ws
+
+        except Exception as e:
+            wait = min(90, (2 ** attempt) + random.uniform(4, 10))
+            log(f"⚠️ DEST connect retry {attempt+1}: {repr(e)[:180]} | sleeping {wait:.1f}s")
+            time.sleep(wait)
+
+    raise Exception("Failed to connect to DEST sheet after retries")
+
+
+def load_source_rows():
+    """
+    Read only this shard's rows.
+    A = company name
+    D = day URL
+    """
+    ws = connect_source_sheet()
+
+    range_a = f"A{START_ROW}:A{END_ROW}"
+    range_d = f"D{START_ROW}:D{END_ROW}"
+
+    for attempt in range(8):
+        try:
+            log(f"📥 Reading shard source ranges: {range_a} and {range_d}")
+            result = ws.batch_get([range_a, range_d])
+
+            col_a = result[0] if len(result) > 0 else []
+            col_d = result[1] if len(result) > 1 else []
+
+            names = [row[0].strip() if row else "" for row in col_a]
+            urls = [row[0].strip() if row else "" for row in col_d]
+
+            max_len = max(len(names), len(urls), SHARD_SIZE)
+
+            if len(names) < max_len:
+                names.extend([""] * (max_len - len(names)))
+            if len(urls) < max_len:
+                urls.extend([""] * (max_len - len(urls)))
+
+            return names[:SHARD_SIZE], urls[:SHARD_SIZE]
+
+        except Exception as e:
+            wait = min(90, (2 ** attempt) + random.uniform(4, 10))
+            log(f"⚠️ SOURCE read retry {attempt+1}: {repr(e)[:180]} | sleeping {wait:.1f}s")
+            time.sleep(wait)
+
+            if is_quota_error(e):
+                continue
+
+            try:
+                ws = connect_source_sheet()
+            except Exception as inner_e:
+                log(f"⚠️ SOURCE reconnect issue: {repr(inner_e)[:150]}")
+
+    raise Exception("Failed to read source rows after retries")
 
 
 try:
-    sheet_main, sheet_data = safe_connect_sheets()
-
-    # Read source data only once
-    all_rows = sheet_main.get(f"A1:D{END_ROW}")
-
-    company_list = []
-    url_day_list = []
-
-    for row in all_rows:
-        company_list.append(row[0].strip() if len(row) > 0 else "")
-        url_day_list.append(row[3].strip() if len(row) > 3 else "")
-
-    log(f"✅ DAY Data Ready. Starting from Row {last_i + 1}")
+    company_list, url_day_list = load_source_rows()
+    sheet_data = connect_dest_sheet()
+    log(f"✅ DAY Data Ready. Starting from Row {last_row}")
 except Exception as e:
-    log(f"❌ Connection Error: {e}")
+    log(f"❌ Connection Error: {repr(e)}")
     sys.exit(1)
 
 
@@ -317,7 +388,7 @@ def flush_batch():
 
     log(f"🚀 UPLOADING DAY BATCH: Sending {buffered_rows} rows...")
 
-    for attempt in range(5):
+    for attempt in range(8):
         try:
             sheet_data.batch_update(batch_list, value_input_option="RAW")
             log("✅ DAY batch written successfully.")
@@ -326,27 +397,31 @@ def flush_batch():
             return True
 
         except Exception as e:
-            wait = (2 ** attempt) + random.uniform(1, 3)
-            log(f"⚠️ DAY write retry {attempt+1}: {str(e)[:150]} | sleeping {wait:.1f}s")
+            wait = min(90, (2 ** attempt) + random.uniform(4, 10))
+            log(f"⚠️ DAY write retry {attempt+1}: {repr(e)[:180]} | sleeping {wait:.1f}s")
             time.sleep(wait)
 
             try:
-                _, sheet_data = safe_connect_sheets()
+                sheet_data = connect_dest_sheet()
             except Exception as inner_e:
-                log(f"⚠️ DAY reconnect failed: {str(inner_e)[:120]}")
+                log(f"⚠️ DEST reconnect failed: {repr(inner_e)[:150]}")
 
     return False
 
 
 # ---------------- MAIN LOOP ---------------- #
 try:
-    loop_end = min(END_ROW, len(company_list))
+    # Convert sheet row to local index inside current shard
+    local_start_index = max(0, last_row - START_ROW)
+    loop_end = min(SHARD_SIZE, len(company_list))
 
-    for i in range(last_i, loop_end):
-        name = company_list[i].strip() if i < len(company_list) else ""
-        log(f"--- [ROW {i+1}] DAY Processing: {name} ---")
+    for local_i in range(local_start_index, loop_end):
+        row_idx = START_ROW + local_i
+        name = company_list[local_i].strip() if local_i < len(company_list) else ""
 
-        u_day = url_day_list[i].strip() if i < len(url_day_list) and url_day_list[i].startswith("http") else None
+        log(f"--- [ROW {row_idx}] DAY Processing: {name} ---")
+
+        u_day = url_day_list[local_i].strip() if local_i < len(url_day_list) and url_day_list[local_i].startswith("http") else None
         vals_day = scrape_day(u_day) if u_day else []
 
         if vals_day == prev_day and vals_day:
@@ -362,29 +437,29 @@ try:
 
         prev_day = vals_day.copy() if vals_day else []
 
-        row_idx = i + 1
-
-        # Writing starts from first column
         batch_list.append({"range": f"{WRITE_NAME_COL}{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"{WRITE_DATE_COL}{row_idx}", "values": [[current_date]]})
-        batch_list.append({"range": f"{WRITE_VALUE_START_COL}{row_idx}", "values": [vals_day] if vals_day else [[]]})
+        batch_list.append({
+            "range": f"{WRITE_VALUE_START_COL}{row_idx}",
+            "values": [vals_day] if vals_day else [[]]
+        })
 
         buffered_rows += 1
 
-        if len(vals_day) == 20:
-            log("   ✅ Correct DAY count: 20")
+        if len(vals_day) == EXPECTED_COUNT:
+            log(f"   ✅ Correct DAY count: {EXPECTED_COUNT}")
         else:
             log(f"   ⚠️ DAY count mismatch: {len(vals_day)}")
 
         log(f"   📥 Buffered {len(vals_day)} DAY values starting from {WRITE_VALUE_START_COL}.")
-        log(f"📈 DAY Progress: {i+1}/{loop_end} | Batch Buffer: {buffered_rows}/{BATCH_SIZE}")
+        log(f"📈 DAY Progress: {local_i + 1}/{loop_end} | Batch Buffer: {buffered_rows}/{BATCH_SIZE}")
 
         with open(checkpoint_file, "w") as f:
-            f.write(str(i + 1))
+            f.write(str(row_idx + 1))
 
-        processed = (i - last_i + 1)
+        processed = (local_i - local_start_index + 1)
         if processed % RESTART_EVERY_ROWS == 0:
-            log(f"♻️ Periodic DAY browser restart after {processed} rows.")
+            log(f"♻️ Periodic browser restart after {processed} rows.")
             restart_driver()
 
         if buffered_rows >= BATCH_SIZE:
