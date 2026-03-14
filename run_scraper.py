@@ -22,10 +22,11 @@ SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
+# Updated file name to 'day'
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 22  
-BATCH_SIZE = 25      
+EXPECTED_COUNT = 22  # Updated to 22 for Day logic
+BATCH_SIZE = 50      # Adjusted for better stability with more data columns
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
@@ -53,6 +54,7 @@ DAY_START_COL_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL)
 DAY_END_COL_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT - 1)
 
 def api_retry(func, *args, **kwargs):
+    """Exponential backoff for Google Sheets API calls."""
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
@@ -109,30 +111,26 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # 1. Wait for the page to at least have the signal gauge
-            WebDriverWait(drv, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='speedometerSignal']"))
-            )
+            # Wait for main signal indicator to ensure page is rendering
+            wait = WebDriverWait(drv, 15)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='speedometerSignal']")))
             
-            # 2. Force Scroll (The "Magic" Fix for empty values)
+            # Force render by scrolling
             drv.execute_script("window.scrollTo(0, 600);")
-            time.sleep(3) 
+            time.sleep(3) # Day values often need slightly longer to compute
             
             vals = get_values(drv)
             
-            # 3. Double-check if we got enough values
-            if len(vals) < 5:
+            if len(vals) < EXPECTED_COUNT:
                 drv.execute_script("window.scrollTo(0, 1000);")
                 time.sleep(2)
                 vals = get_values(drv)
 
-            clean_vals = [v for v in vals if v]
-            if len(clean_vals) >= 1:
-                log(f"    📊 Found {len(clean_vals)} values: {clean_vals[:3]}...")
-                return clean_vals[:EXPECTED_COUNT]
+            if len(vals) >= 1:
+                return vals[:EXPECTED_COUNT]
                 
         except Exception as e:
-            log(f"    ❌ Scrape Attempt {attempt+1} Failed: {str(e)[:50]}")
+            log(f"   ❌ Scrape Attempt {attempt+1} Failed: {str(e)[:50]}")
             restart_driver()
     return []
 
@@ -140,13 +138,13 @@ def scrape_day(url):
 def connect_sheets():
     gc = gspread.service_account("credentials.json")
     sh_main = gc.open("Stock List").worksheet("Sheet1")
-    sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
+    sh_data = gc.open("MV2 DAY").worksheet("Sheet1") # Pointing to DAY sheet
     return sh_main, sh_data
 
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 4) 
+    url_list = api_retry(sheet_main.col_values, 4) # URL column for DAY is index 4
     log(f"✅ Ready. Processing Rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
     log(f"❌ Initial Connection Error: {e}"); sys.exit(1)
@@ -165,7 +163,7 @@ try:
         row_idx = i + 1
         padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
         
-        # Exact "Week" style batching
+        # Build batch updates (matching your proven structure)
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"B{row_idx}", "values": [[current_date]]})
         batch_list.append({
@@ -173,10 +171,10 @@ try:
             "values": [padded_vals]
         })
 
+        # Checkpoint every row
         with open(checkpoint_file, "w") as f: f.write(str(i + 1))
         
-        if (i + 1) % RESTART_EVERY_ROWS == 0: 
-            restart_driver()
+        if (i + 1) % RESTART_EVERY_ROWS == 0: restart_driver()
 
         if len(batch_list) // 3 >= BATCH_SIZE:
             log(f"🚀 Uploading batch of {BATCH_SIZE}...")
@@ -188,4 +186,4 @@ finally:
         log("🚀 Uploading final batch...")
         api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
     restart_driver()
-    log("🏁 DAY SHARD COMPLETED.")
+    log("🏁 SHARD COMPLETED.")
