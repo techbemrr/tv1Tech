@@ -25,7 +25,7 @@ END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
 EXPECTED_COUNT = 22  
-BATCH_SIZE = 20  # Reduced for more frequent updates and better reliability
+BATCH_SIZE = 20  
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
@@ -106,7 +106,6 @@ def restart_driver():
 # ---------------- SCRAPER ---------------- #
 def get_values(drv):
     try:
-        # Targeting the specific TradingView value class
         elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
         return [el.text.strip() for el in elements if el.text.strip()]
     except: return []
@@ -117,24 +116,15 @@ def scrape_day(url):
         try:
             drv = ensure_driver()
             drv.get(url)
-            
-            # Explicit wait for technical values to load
-            WebDriverWait(drv, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']"))
-            )
-            
-            time.sleep(2) 
+            WebDriverWait(drv, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
+            time.sleep(2.5) 
             vals = get_values(drv)
-            
             if len(vals) < EXPECTED_COUNT:
                 drv.execute_script("window.scrollTo(0, 500);")
-                time.sleep(1.5)
+                time.sleep(2)
                 vals = get_values(drv)
-
-            # Ensure we return exactly the EXPECTED_COUNT
             clean_vals = [v for v in vals if v][:EXPECTED_COUNT]
             return (clean_vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
-                
         except Exception as e:
             log(f"    ❌ Scrape Attempt {attempt+1} Failed: {str(e)[:50]}")
             restart_driver()
@@ -148,15 +138,14 @@ def connect_sheets():
     return sh_main, sh_data
 
 def flush_to_sheet(worksheet, start_row, data_list):
-    """Writes a 2D list of data to the sheet in one API call."""
     if not data_list: return
     num_rows = len(data_list)
-    # Range covers Name, Date, and 22 technical values (Total 24 columns)
     end_col_letter = col_num_to_letter(2 + EXPECTED_COUNT)
     range_label = f"A{start_row}:{end_col_letter}{start_row + num_rows - 1}"
     
     log(f"🚀 Uploading batch: {range_label}")
-    api_retry(worksheet.update, range_label, data_list, value_input_option="RAW")
+    # FIX: Using named arguments to avoid DeprecationWarning
+    api_retry(worksheet.update, range_name=range_label, values=data_list, value_input_option="RAW")
 
 try:
     sheet_main, sheet_data = connect_sheets()
@@ -175,25 +164,18 @@ try:
     for i in range(last_i, loop_end):
         name = company_list[i].strip()
         url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
-        
         log(f"🔍 [{i+1}/{loop_end}] {name}")
         vals = scrape_day(url)
-        
-        # Combine [Name, Date, Val1, Val2... Val22] into one row
         row_data = [name, current_date] + vals
         current_batch.append(row_data)
 
-        # Checkpoint
         with open(checkpoint_file, "w") as f: f.write(str(i + 1))
-        
-        if (i + 1) % RESTART_EVERY_ROWS == 0: 
-            restart_driver()
+        if (i + 1) % RESTART_EVERY_ROWS == 0: restart_driver()
 
         if len(current_batch) >= BATCH_SIZE:
             flush_to_sheet(sheet_data, batch_start_row, current_batch)
             current_batch = []
             batch_start_row = i + 2 
-
 finally:
     if current_batch:
         flush_to_sheet(sheet_data, batch_start_row, current_batch)
