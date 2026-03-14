@@ -24,13 +24,13 @@ START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 22  
-BATCH_SIZE = 5  
-RESTART_EVERY_ROWS = 15 # Restart more frequently to keep memory clean
+EXPECTED_COUNT = 22
+BATCH_SIZE = 50
+RESTART_EVERY_ROWS = 15
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-DAY_OUTPUT_START_COL = 3 
+DAY_OUTPUT_START_COL = 3
 
 # ---------------- STATE ---------------- #
 if os.path.exists(checkpoint_file):
@@ -91,22 +91,27 @@ def create_driver():
             for c in cookies:
                 try:
                     drv.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
-                except: continue
+                except:
+                    continue
             drv.refresh()
             time.sleep(2)
-        except: pass
+        except:
+            pass
     return drv
 
 def ensure_driver():
     global driver
-    if driver is None: driver = create_driver()
+    if driver is None:
+        driver = create_driver()
     return driver
 
 def restart_driver():
     global driver
     if driver:
-        try: driver.quit()
-        except: pass
+        try:
+            driver.quit()
+        except:
+            pass
     driver = None
 
 # ---------------- SCRAPER ---------------- #
@@ -114,42 +119,43 @@ def get_values(drv):
     try:
         elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
         return [el.text.strip() for el in elements if el.text.strip() and el.text.strip() not in ("—", "")]
-    except: return []
+    except:
+        return []
 
 def scrape_day(url):
-    if not url: return []
-    for attempt in range(3): # Increased to 3 attempts per symbol
+    if not url:
+        return None, "Not Found"
+
+    for attempt in range(3):
         try:
             drv = ensure_driver()
             drv.get(url)
-            
-            # Wait for specific UI element
+
             wait = WebDriverWait(drv, 20)
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
-            
-            # Dynamic Wait: Check if values actually appeared
-            for _ in range(5): # Check 5 times with small sleeps
+
+            for _ in range(5):
                 vals = get_values(drv)
-                if len(vals) >= 10: # If we see at least 10 indicators, it's loading well
+                if len(vals) >= 10:
                     break
                 drv.execute_script("window.scrollTo(0, 500);")
                 time.sleep(1.5)
-            
-            # Final scroll for bottom indicators
+
             drv.execute_script("window.scrollTo(0, 1000);")
             time.sleep(2)
+
             vals = get_values(drv)
 
             if len(vals) > 0:
-                # Pad to ensure the list length matches your columns
-                return (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
-                
+                vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
+                return vals, "OK"
+
         except Exception as e:
-            log(f"    ❌ Attempt {attempt+1} failed for {url[:50]}")
-            restart_driver() # Hard reset driver on failure
+            log(f"    ❌ Attempt {attempt + 1} failed for {url[:60]} | {str(e)[:100]}")
+            restart_driver()
             time.sleep(2)
-            
-    return []
+
+    return ["Not Found"] * EXPECTED_COUNT, "Not Found"
 
 # ---------------- MAIN ---------------- #
 def connect_sheets():
@@ -161,33 +167,29 @@ def connect_sheets():
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 4) 
+    url_list = api_retry(sheet_main.col_values, 4)
     log(f"✅ Connection Stable. Processing {len(company_list)} symbols.")
 except Exception as e:
-    log(f"❌ Initial Connection Error: {e}"); sys.exit(1)
+    log(f"❌ Initial Connection Error: {e}")
+    sys.exit(1)
 
 batch_list = []
 current_date = date.today().strftime("%m/%d/%Y")
 
 try:
     loop_end = min(END_ROW, len(company_list))
-    for i in range(last_i, loop_end):
-        name = company_list[i].strip()
-        url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
-        
-        vals = scrape_day(url)
-        
-        # If we got absolutely nothing after 3 tries, log it but don't break the sheet
-        if not vals:
-            log(f"🛑 [{i+1}] {name}: SKIPPED (No data after retries)")
-            with open(checkpoint_file, "w") as f: f.write(str(i + 1))
-            continue
 
-        log(f"🔍 [{i+1}/{loop_end}] {name} | Found {len([v for v in vals if v])} values")
-        
+    for i in range(last_i, loop_end):
+        name = company_list[i].strip() if i < len(company_list) else f"Row-{i+1}"
+        url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
+
+        vals, status = scrape_day(url)
+
+        filled_count = len([v for v in vals if v and v != "Not Found"])
+        log(f"🔍 [{i+1}/{loop_end}] {name} | Status: {status} | Found {filled_count} values")
+
         row_idx = i + 1
-        
-        # Add to batch
+
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"B{row_idx}", "values": [[current_date]]})
         batch_list.append({
@@ -195,22 +197,26 @@ try:
             "values": [vals]
         })
 
-        # Save progress
-        with open(checkpoint_file, "w") as f: f.write(str(i + 1))
-        
-        # Periodic driver restart to prevent lag
-        if (i + 1) % RESTART_EVERY_ROWS == 0: 
+        with open(checkpoint_file, "w") as f:
+            f.write(str(i + 1))
+
+        if (i + 1) % RESTART_EVERY_ROWS == 0:
             restart_driver()
 
-        # Small batch upload for safety
         if len(batch_list) >= (BATCH_SIZE * 3):
             log(f"🚀 Pushing {BATCH_SIZE} rows to Google Sheets...")
-            if api_retry(sheet_data.batch_update, batch_list, value_input_option="USER_ENTERED"):
+            result = api_retry(sheet_data.batch_update, batch_list, value_input_option="USER_ENTERED")
+            if result:
                 batch_list = []
+            else:
+                log("❌ Batch update failed. Keeping data in memory for final retry.")
 
 finally:
     if batch_list:
         log("🚀 Pushing final rows...")
-        api_retry(sheet_data.batch_update, batch_list, value_input_option="USER_ENTERED")
+        result = api_retry(sheet_data.batch_update, batch_list, value_input_option="USER_ENTERED")
+        if not result:
+            log("❌ Final batch push failed.")
+
     restart_driver()
     log("🏁 SHARD COMPLETED.")
