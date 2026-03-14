@@ -22,10 +22,11 @@ SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
+# Updated file name to 'day'
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 22  
-BATCH_SIZE = 20  
+EXPECTED_COUNT = 22  # Updated for Day logic
+BATCH_SIZE = 25      # Efficiency balanced with stability
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
@@ -48,6 +49,7 @@ def col_num_to_letter(n):
     return result
 
 def api_retry(func, *args, **kwargs):
+    """Exponential backoff for Google Sheets API calls."""
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
@@ -116,15 +118,23 @@ def scrape_day(url):
         try:
             drv = ensure_driver()
             drv.get(url)
-            WebDriverWait(drv, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
-            time.sleep(2.5) 
+            
+            wait = WebDriverWait(drv, 15)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
+            
+            time.sleep(2.5) # Stability sleep
             vals = get_values(drv)
+            
             if len(vals) < EXPECTED_COUNT:
                 drv.execute_script("window.scrollTo(0, 500);")
                 time.sleep(2)
                 vals = get_values(drv)
-            clean_vals = [v for v in vals if v][:EXPECTED_COUNT]
+
+            clean_vals = [v for v in vals if v]
+            log(f"    📊 Found {len(clean_vals)} values: {clean_vals[:5]}...")
+            
             return (clean_vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
+                
         except Exception as e:
             log(f"    ❌ Scrape Attempt {attempt+1} Failed: {str(e)[:50]}")
             restart_driver()
@@ -140,18 +150,18 @@ def connect_sheets():
 def flush_to_sheet(worksheet, start_row, data_list):
     if not data_list: return
     num_rows = len(data_list)
+    # Range covers Name, Date, and 22 values (Columns A to X)
     end_col_letter = col_num_to_letter(2 + EXPECTED_COUNT)
     range_label = f"A{start_row}:{end_col_letter}{start_row + num_rows - 1}"
     
-    log(f"🚀 Uploading batch: {range_label}")
-    # FIX: Using named arguments to avoid DeprecationWarning
+    log(f"🚀 Uploading batch to {range_label} ({num_rows} rows)")
     api_retry(worksheet.update, range_name=range_label, values=data_list, value_input_option="RAW")
 
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 4) 
-    log(f"✅ Ready. Rows {last_i + 1} to {min(END_ROW, len(company_list))}")
+    url_list = api_retry(sheet_main.col_values, 4) # URL index 4 for DAY
+    log(f"✅ Connection Success. Rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
     log(f"❌ Connection Error: {e}"); sys.exit(1)
 
@@ -164,18 +174,25 @@ try:
     for i in range(last_i, loop_end):
         name = company_list[i].strip()
         url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
+        
         log(f"🔍 [{i+1}/{loop_end}] {name}")
         vals = scrape_day(url)
+        
+        # Row layout: [Symbol Name, Current Date, Value 1, Value 2... Value 22]
         row_data = [name, current_date] + vals
         current_batch.append(row_data)
 
+        # Update checkpoint
         with open(checkpoint_file, "w") as f: f.write(str(i + 1))
-        if (i + 1) % RESTART_EVERY_ROWS == 0: restart_driver()
+        
+        if (i + 1) % RESTART_EVERY_ROWS == 0: 
+            restart_driver()
 
         if len(current_batch) >= BATCH_SIZE:
             flush_to_sheet(sheet_data, batch_start_row, current_batch)
             current_batch = []
             batch_start_row = i + 2 
+
 finally:
     if current_batch:
         flush_to_sheet(sheet_data, batch_start_row, current_batch)
