@@ -22,16 +22,14 @@ SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
-# Updated for DAY
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 22  # Day has 22 values
-BATCH_SIZE = 20      # Smaller batches are safer for complex 'batch_update'
+EXPECTED_COUNT = 22  
+BATCH_SIZE = 25      
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-# Day output typically starts at column 3 (C)
 DAY_OUTPUT_START_COL = 3 
 
 # ---------------- STATE ---------------- #
@@ -111,23 +109,26 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # Wait for technicals to load
-            WebDriverWait(drv, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']"))
+            # 1. Wait for the page to at least have the signal gauge
+            WebDriverWait(drv, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='speedometerSignal']"))
             )
             
-            # Additional settling time for Day logic
+            # 2. Force Scroll (The "Magic" Fix for empty values)
+            drv.execute_script("window.scrollTo(0, 600);")
             time.sleep(3) 
+            
             vals = get_values(drv)
             
-            if len(vals) < EXPECTED_COUNT:
-                drv.execute_script("window.scrollTo(0, 500);")
+            # 3. Double-check if we got enough values
+            if len(vals) < 5:
+                drv.execute_script("window.scrollTo(0, 1000);")
                 time.sleep(2)
                 vals = get_values(drv)
 
             clean_vals = [v for v in vals if v]
             if len(clean_vals) >= 1:
-                log(f"    📊 Found {len(clean_vals)} values")
+                log(f"    📊 Found {len(clean_vals)} values: {clean_vals[:3]}...")
                 return clean_vals[:EXPECTED_COUNT]
                 
         except Exception as e:
@@ -145,7 +146,7 @@ def connect_sheets():
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 4) # URL column for DAY
+    url_list = api_retry(sheet_main.col_values, 4) 
     log(f"✅ Ready. Processing Rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
     log(f"❌ Initial Connection Error: {e}"); sys.exit(1)
@@ -164,7 +165,7 @@ try:
         row_idx = i + 1
         padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
         
-        # Build batch updates using your "Week" dictionary style
+        # Exact "Week" style batching
         batch_list.append({"range": f"A{row_idx}", "values": [[name]]})
         batch_list.append({"range": f"B{row_idx}", "values": [[current_date]]})
         batch_list.append({
@@ -174,9 +175,9 @@ try:
 
         with open(checkpoint_file, "w") as f: f.write(str(i + 1))
         
-        if (i + 1) % RESTART_EVERY_ROWS == 0: restart_driver()
+        if (i + 1) % RESTART_EVERY_ROWS == 0: 
+            restart_driver()
 
-        # Batch Size check (3 items per row in batch_list)
         if len(batch_list) // 3 >= BATCH_SIZE:
             log(f"🚀 Uploading batch of {BATCH_SIZE}...")
             api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
