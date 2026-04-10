@@ -28,7 +28,7 @@ checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.tx
 
 EXPECTED_COUNT = 26
 BATCH_SIZE = 100
-RESTART_EVERY_ROWS = 20
+RESTART_EVERY_ROWS = 50   # 🔥 optimized
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
@@ -60,7 +60,7 @@ def api_retry(func, *args, **kwargs):
             log(f"⏳ Retry in {wait:.1f}s...")
             time.sleep(wait)
     log("❌ API failed after retries")
-    return func(*args, **kwargs)
+    raise Exception("API completely failed")
 
 # ---------------- STATE ---------------- #
 if os.path.exists(checkpoint_file):
@@ -109,9 +109,8 @@ def create_driver():
             drv.refresh()
             time.sleep(2)
             log("✅ Cookies loaded")
-        except Exception:
+        except:
             log("⚠️ Cookie load failed")
-            log(traceback.format_exc())
 
     return drv
 
@@ -133,14 +132,8 @@ def restart_driver():
 
 # ---------------- SCRAPER ---------------- #
 def get_values(drv):
-    try:
-        elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
-        vals = [el.text.strip() for el in elements if el.text.strip()]
-        return vals
-    except Exception:
-        log("❌ get_values error")
-        log(traceback.format_exc())
-        return []
+    elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
+    return [el.text.strip() for el in elements if el.text.strip()]
 
 def scrape_day(url):
     if not url:
@@ -160,139 +153,102 @@ def scrape_day(url):
             vals = get_values(drv)
 
             if len(vals) < EXPECTED_COUNT:
-                log(f"⚠️ Only {len(vals)} values, scrolling...")
-                for scroll_y in [500, 1000, 1500, 2000]:
+                for scroll_y in [500, 1000, 1500]:
                     drv.execute_script(f"window.scrollTo(0, {scroll_y});")
-                    time.sleep(1.5)
-                    new_vals = get_values(drv)
-                    if len(new_vals) > len(vals):
-                        vals = new_vals
+                    time.sleep(1)
+                    vals = get_values(drv)
                     if len(vals) >= EXPECTED_COUNT:
                         break
 
             browser_url = drv.current_url
-            found_count = len(vals)
+            count = len(vals)
 
-            if found_count >= EXPECTED_COUNT:
-                log(f"✅ Found {found_count} values")
+            if count >= EXPECTED_COUNT:
                 return vals[:EXPECTED_COUNT], "OK", url, browser_url
             else:
-                log(f"⚠️ Only found {found_count} values")
-                padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
-                return padded_vals, f"Only {found_count} Found", url, browser_url
+                return (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT], f"Only {count} Found", url, browser_url
 
-        except Exception:
-            log(f"❌ Scrape Attempt {attempt + 1} FAILED")
-            log(traceback.format_exc())
+        except:
+            log("❌ Scrape failed, retrying...")
             restart_driver()
 
     return [""] * EXPECTED_COUNT, "Failed", url, ""
 
 # ---------------- SHEETS ---------------- #
 def connect_sheets():
-    try:
-        log("🔐 Connecting to Google Sheets...")
-
-        if not os.path.exists("credentials.json"):
-            raise Exception("credentials.json NOT FOUND")
-
-        gc = gspread.service_account("credentials.json")
-        log("✅ Authenticated")
-
-        sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
-        log("✅ Opened STOCKLIST 2 → Sheet1")
-
-        sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
-        log("✅ Opened MV2 DAY → Sheet1")
-
-        return sh_main, sh_data
-
-    except Exception:
-        log("❌ Sheet Connection FAILED")
-        log(traceback.format_exc())
-        raise
+    gc = gspread.service_account("credentials.json")
+    sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
+    sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
+    return sh_main, sh_data
 
 # ---------------- PROCESS ---------------- #
-def process_row(i, company_list, url_list, current_date):
+def process_row(i, company_list, url_list, current_date, sheet_name):
     name = company_list[i].strip() if i < len(company_list) else ""
     url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
-
-    log(f"🔍 Row {i+1}: {name}")
-    log(f"🌐 URL: {url}")
 
     vals, status, sheet_url_used, browser_url_used = scrape_day(url)
 
     row_idx = i + 1
-    row_payload = [
-        {"range": f"A{row_idx}", "values": [[name]]},
-        {"range": f"B{row_idx}", "values": [[current_date]]},
-        {"range": f"{DAY_START_COL_LETTER}{row_idx}:{DAY_END_COL_LETTER}{row_idx}", "values": [vals]},
-        {"range": f"{STATUS_COL}{row_idx}", "values": [[status]]},
-        {"range": f"{SHEET_URL_COL}{row_idx}", "values": [[sheet_url_used]]},
-        {"range": f"{BROWSER_URL_COL}{row_idx}", "values": [[browser_url_used]]}
-    ]
 
-    return row_payload, (status == "OK")
+    return [
+        {"range": f"{sheet_name}!A{row_idx}", "values": [[name]]},
+        {"range": f"{sheet_name}!B{row_idx}", "values": [[current_date]]},
+        {"range": f"{sheet_name}!{DAY_START_COL_LETTER}{row_idx}:{DAY_END_COL_LETTER}{row_idx}", "values": [vals]},
+        {"range": f"{sheet_name}!{STATUS_COL}{row_idx}", "values": [[status]]},
+        {"range": f"{sheet_name}!{SHEET_URL_COL}{row_idx}", "values": [[sheet_url_used]]},
+        {"range": f"{sheet_name}!{BROWSER_URL_COL}{row_idx}", "values": [[browser_url_used]]}
+    ], (status == "OK")
 
 # ---------------- MAIN ---------------- #
-try:
-    sheet_main, sheet_data = connect_sheets()
+sheet_main, sheet_data = connect_sheets()
+sheet_name = sheet_data.title
 
-    log("📥 Fetching company list...")
-    company_list = api_retry(sheet_main.col_values, 1)
-    log(f"✅ Got {len(company_list)} companies")
-
-    log("📥 Fetching URL list...")
-    url_list = api_retry(sheet_main.col_values, 4)
-    log(f"✅ Got {len(url_list)} URLs")
-
-    log(f"🚀 Processing rows {START_ROW+1} to {END_ROW}")
-
-except Exception:
-    log("❌ Initial Connection Error FULL TRACE")
-    log(traceback.format_exc())
-    sys.exit(1)
+company_list = api_retry(sheet_main.col_values, 1)
+url_list = api_retry(sheet_main.col_values, 4)
 
 retry_indices = []
 batch_list = []
 current_date = date.today().strftime("%m/%d/%Y")
+
 loop_end = min(END_ROW, len(company_list))
 
-# ---------------- FIRST PASS ---------------- #
-try:
-    for i in range(last_i, loop_end):
-        payload, success = process_row(i, company_list, url_list, current_date)
-        batch_list.extend(payload)
+# 🔥 Skip header row
+for i in range(max(1, last_i), loop_end):
 
-        if not success:
-            retry_indices.append(i)
+    payload, success = process_row(i, company_list, url_list, current_date, sheet_name)
+    batch_list.extend(payload)
 
-        with open(checkpoint_file, "w") as f:
-            f.write(str(i + 1))
+    if not success:
+        retry_indices.append(i)
 
-        if (i + 1) % RESTART_EVERY_ROWS == 0:
-            restart_driver()
+    with open(checkpoint_file, "w") as f:
+        f.write(str(i + 1))
 
-        if len(batch_list) // 6 >= BATCH_SIZE:
-            log(f"🚀 Uploading batch of {BATCH_SIZE} rows")
+    if (i + 1) % RESTART_EVERY_ROWS == 0:
+        restart_driver()
+
+    if len(batch_list) // 6 >= BATCH_SIZE:
+        try:
             api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
-            batch_list = []
+        except:
+            log("❌ Batch failed, clearing...")
+        batch_list = []
 
-finally:
-    if batch_list:
+# Final flush
+if batch_list:
+    try:
         api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+    except:
+        log("❌ Final batch failed")
 
-# ---------------- RETRY PASS ---------------- #
+# Retry failed rows
 if retry_indices:
-    log(f"🔁 Retrying {len(retry_indices)} failed rows")
     restart_driver()
+    batch_list = []
 
-    for idx, i in enumerate(retry_indices):
-        payload, success = process_row(i, company_list, url_list, current_date)
+    for i in retry_indices:
+        payload, _ = process_row(i, company_list, url_list, current_date, sheet_name)
         batch_list.extend(payload)
-
-        if (idx + 1) % 10 == 0:
-            restart_driver()
 
         if len(batch_list) // 6 >= 10:
             api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
