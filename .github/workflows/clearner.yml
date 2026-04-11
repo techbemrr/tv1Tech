@@ -1,0 +1,48 @@
+name: TradingView Sharded Scraper
+
+on:
+  workflow_dispatch: # Allows manual trigger
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 5 Shards: 0 (0-499), 1 (500-999), 2 (1000-1499), 3 (1500-1999), 4 (2000-2499)
+        shard: [0, 1, 2, 3, 4]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium webdriver-manager gspread oauth2client
+
+      - name: Create Credentials and Cookies
+        run: |
+          echo '${{ secrets.GSPREAD_JSON }}' > credentials.json
+          echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
+
+      - name: Run Scraper Shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_SIZE: 500
+          CHECKPOINT_FILE: "checkpoint_day_${{ matrix.shard }}.txt"
+        run: python cleaner.py
+
+      - name: Save Checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpoint-shard-${{ matrix.shard }}
+          path: checkpoint_day_${{ matrix.shard }}.txt
