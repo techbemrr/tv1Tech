@@ -47,7 +47,7 @@ def api_retry(func, *args, **kwargs):
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             wait = (2 ** attempt) + random.random()
             log(f"⚠️ API retry in {wait:.1f}s...")
             time.sleep(wait)
@@ -66,7 +66,6 @@ def create_driver():
 
     drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
 
-    # Load cookies (optional)
     try:
         drv.get("https://in.tradingview.com/")
         with open(COOKIE_FILE, "r") as f:
@@ -163,8 +162,8 @@ def find_not_ok_rows(sheet_data, company_list):
 
     for i, val in enumerate(status_values[1:], start=1):
         if val.strip().upper() == "NOT OK":
-            name = company_list[i].strip() if i < len(company_list) else "UNKNOWN"
-            log(f"❌ Found NOT OK → Row {i+1} | {name}")
+            name = company_list[i - 1].strip() if i-1 < len(company_list) else "UNKNOWN"
+            log(f"❌ Found NOT OK → Row {i} | {name}")
             indices.append(i)
 
     log(f"⚠️ Total NOT OK rows: {len(indices)}")
@@ -172,17 +171,17 @@ def find_not_ok_rows(sheet_data, company_list):
 
 # ---------------- PROCESS ---------------- #
 def process_row(i, company_list, url_list, current_date):
-    name = company_list[i].strip()
-    url = url_list[i].strip() if "http" in url_list[i] else None
+    name = company_list[i - 1].strip()
+    url = url_list[i - 1].strip() if "http" in url_list[i - 1] else None
 
-    log(f"🚀 Processing → Row {i+1} | {name}")
+    log(f"🚀 Processing → Row {i} | {name}")
 
     vals, status, sheet_url, browser_url = scrape_day(url)
 
     filled = sum(1 for v in vals if v.strip())
     log(f"📊 Result → {name} | {filled}/{EXPECTED_COUNT} | {status}")
 
-    row_idx = i + 1
+    row_idx = i
 
     return [
         {"range": f"A{row_idx}", "values": [[name]]},
@@ -215,7 +214,7 @@ def main():
     for idx, i in enumerate(not_ok_rows):
         log(f"🔄 Progress: {idx+1}/{total}")
 
-        batch.extend(process_row(i - 1, company_list, url_list, current_date))
+        batch.extend(process_row(i, company_list, url_list, current_date))
 
         if (idx + 1) % 10 == 0:
             restart_driver()
