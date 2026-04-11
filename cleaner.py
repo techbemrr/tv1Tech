@@ -1,8 +1,9 @@
+import sys
+import os
 import time
 import json
 import random
-import os
-import sys
+from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -17,41 +18,54 @@ def log(msg):
     print(f"[{t}] {msg}", flush=True)
 
 # ---------------- CONFIG ---------------- #
+# Using same env vars as your main YML
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
+SHARD_SIZE = int(os.getenv("SHARD_SIZE", "510")) # Adjusted to match your YML total
+START_ROW = SHARD_INDEX * SHARD_SIZE
+END_ROW = START_ROW + SHARD_SIZE
+
 EXPECTED_COUNT = 26
 COOKIE_FILE = "cookies.json"
-CREDS_FILE = "credentials.json"
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-# Column Indexing for MV2 DAY (1-based for gspread)
-NAME_COL = 1        
-STATUS_COL = 29     
-URL_COL = 30        
-DATA_START_COL = "C"
-DATA_END_COL = "AB"
+DAY_OUTPUT_START_COL = 3 
+
+# ---------------- UTILS ---------------- #
+def col_num_to_letter(n):
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+# Mapping columns for update
+STATUS_COL_IDX = DAY_OUTPUT_START_COL + EXPECTED_COUNT
+STATUS_COL_LETTER = col_num_to_letter(STATUS_COL_IDX)
+DATA_START_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL)
+DATA_END_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT - 1)
 
 # ---------------- DRIVER ---------------- #
 def create_driver():
-    log("🌐 Initializing Browser...")
+    log(f"🌐 [CLEANER Shard {SHARD_INDEX}] Initializing...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
-    
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
     drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     
     if os.path.exists(COOKIE_FILE):
         try:
             drv.get("https://in.tradingview.com/")
-            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            with open(COOKIE_FILE, "r") as f:
                 cookies = json.load(f)
             for c in cookies:
-                cookie_data = {k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")}
-                drv.add_cookie(cookie_data)
+                drv.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
             drv.refresh()
-        except Exception as e:
-            log(f"⚠️ Cookie Warning: {e}")
-            
+            time.sleep(2)
+        except: pass
     return drv
 
 # ---------------- SCRAPER ---------------- #
@@ -59,81 +73,68 @@ def aggressive_scrape(drv, url):
     try:
         drv.get(url)
         drv.execute_script("document.body.style.zoom='50%'")
-        WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
+        WebDriverWait(drv, 25).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
         
-        for i in range(4):
-            js_script = 'return Array.from(document.querySelectorAll("[class*=\'valueValue\'], [class*=\'value-\']")).map(el => el.innerText.trim()).filter(txt => txt.length > 0);'
-            vals = drv.execute_script(js_script)
+        # High intensity wait/scroll
+        for _ in range(4):
+            js = "return Array.from(document.querySelectorAll(\"[class*='valueValue'], [class*='value-']\")).map(el => el.innerText.trim()).filter(txt => txt.length > 0);"
+            vals = drv.execute_script(js)
             if len(vals) >= EXPECTED_COUNT:
                 return vals[:EXPECTED_COUNT]
-            drv.execute_script(f"window.scrollBy(0, 400);")
-            time.sleep(2)
+            drv.execute_script("window.scrollBy(0, 400);")
+            time.sleep(2.5)
         return vals
-    except Exception as e:
-        log(f"   ❌ Scrape Failed: {str(e)[:50]}")
+    except:
         return []
 
-# ---------------- MAIN CLEANUP ---------------- #
+# ---------------- MAIN ---------------- #
 def run_cleanup():
-    log("🚀 Starting Cleanup Process...")
+    gc = gspread.service_account("credentials.json")
+    sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
+    sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
+
+    # Load all data to minimize API hits
+    log("📥 Fetching sheet data...")
+    all_data = sh_data.get_all_values()
+    stock_list = sh_main.get_all_values()
     
-    if not os.path.exists(CREDS_FILE):
-        log(f"❌ CRITICAL: {CREDS_FILE} is missing!")
-        return
+    # Map Symbol to URL (Column 1 to Column 4)
+    url_map = {row[0].strip(): row[3].strip() for row in stock_list if len(row) > 3}
 
-    try:
-        log(f"🔑 Attempting to authenticate with {CREDS_FILE}...")
-        gc = gspread.service_account(filename=CREDS_FILE)
-        
-        log("📊 Opening Worksheets...")
-        sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
-        sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
-        
-        log("📥 Fetching Sheet Data...")
-        all_data_rows = sh_data.get_all_values()
-        stock_list_raw = sh_main.get_all_values()
-        log(f"✅ Found {len(all_data_rows)} rows in MV2 DAY.")
-    except Exception as e:
-        log(f"❌ Connection Error: {e}")
-        # Debug: Print file content length to see if it's empty
-        if os.path.exists(CREDS_FILE):
-            log(f"DEBUG: {CREDS_FILE} size is {os.path.getsize(CREDS_FILE)} bytes.")
-        return
-
-    url_map = {row[0].strip(): row[3].strip() for row in stock_list_raw if len(row) > 3}
     driver = create_driver()
-    
     fixed_count = 0
-    try:
-        for i, row in enumerate(all_data_rows):
-            if i == 0: continue
-            row_num = i + 1
-            
-            symbol = row[NAME_COL-1].strip()
-            status = row[STATUS_COL-1] if len(row) >= STATUS_COL else "EMPTY"
-            
-            if status != "OK":
-                url = url_map.get(symbol)
-                if not url:
-                    log(f"⏭️ Row {row_num} [{symbol}]: No URL found in Stocklist. Skipping.")
-                    continue
+    
+    # Define range based on Shard
+    loop_end = min(END_ROW, len(all_data))
+    
+    for i in range(START_ROW, loop_end):
+        if i == 0: continue # Skip header
+        row = all_data[i]
+        symbol = row[0].strip()
+        status = row[STATUS_COL_IDX - 1] if len(row) >= STATUS_COL_IDX else ""
+        
+        if status != "OK":
+            url = url_map.get(symbol)
+            if not url: continue
 
-                log(f"🔍 Row {row_num} [{symbol}]: Status is '{status}'. Retrying...")
-                new_vals = aggressive_scrape(driver, url)
+            log(f"🛠️ Fixing Row {i+1} [{symbol}]")
+            new_vals = aggressive_scrape(driver, url)
 
-                if len(new_vals) >= EXPECTED_COUNT:
-                    sh_data.update(f"{DATA_START_COL}{row_num}:{DATA_END_COL}{row_num}", [new_vals])
-                    sh_data.update_cell(row_num, STATUS_COL, "OK")
-                    log(f"✅ Row {row_num} [{symbol}]: Fixed successfully.")
-                    fixed_count += 1
-                else:
-                    log(f"⚠️ Row {row_num} [{symbol}]: Only found {len(new_vals)} values. Still failing.")
-                
-                time.sleep(1)
+            if len(new_vals) >= EXPECTED_COUNT:
+                # Update data and status
+                sh_data.update(f"{DATA_START_LETTER}{i+1}:{DATA_END_LETTER}{i+1}", [new_vals])
+                sh_data.update_cell(i+1, STATUS_COL_IDX, "OK")
+                log(f"✅ Fixed!")
+                fixed_count += 1
+            else:
+                log(f"⚠️ Still failed ({len(new_vals)} values found)")
 
-    finally:
-        if driver: driver.quit()
-        log(f"🏁 Cleanup Finished. Total symbols fixed: {fixed_count}")
+        if (i + 1) % 20 == 0:
+            driver.quit()
+            driver = create_driver()
+
+    driver.quit()
+    log(f"🏁 Cleanup Shard {SHARD_INDEX} complete. Fixed: {fixed_count}")
 
 if __name__ == "__main__":
     run_cleanup()
