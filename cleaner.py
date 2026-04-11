@@ -18,7 +18,6 @@ def log(msg):
     print(f"[{t}] {msg}", flush=True)
 
 # ---------------- CONFIG ---------------- #
-# Matches your YML shard setup
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_SIZE = int(os.getenv("SHARD_SIZE", "510")) 
 START_ROW = SHARD_INDEX * SHARD_SIZE
@@ -29,6 +28,8 @@ COOKIE_FILE = "cookies.json"
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 DAY_OUTPUT_START_COL = 3 
+# You requested to check Column Y specifically for Status
+STATUS_COL_IDX = 25  # Column Y is the 25th column
 
 # ---------------- UTILS ---------------- #
 def col_num_to_letter(n):
@@ -38,7 +39,6 @@ def col_num_to_letter(n):
         result = chr(65 + rem) + result
     return result
 
-STATUS_COL_IDX = DAY_OUTPUT_START_COL + EXPECTED_COUNT
 DATA_START_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL)
 DATA_END_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT - 1)
 
@@ -47,7 +47,7 @@ def api_retry(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            wait = (attempt * 2) + 5 
+            wait = (attempt * 3) + 5 
             log(f"⚠️ API Issue: {str(e)[:50]}. Waiting {wait}s...")
             time.sleep(wait)
     return None
@@ -80,24 +80,33 @@ def create_driver():
 def aggressive_scrape(drv, url):
     try:
         drv.get(url)
-        # Force browser to zoom out so more data is "visible" for the scraper
-        drv.execute_script("document.body.style.zoom='50%'")
+        drv.execute_script("document.body.style.zoom='40%'") # Zoom out even more
         
-        # Longer wait for the data container
-        WebDriverWait(drv, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
-        
-        for _ in range(4):
-            # JS script pulls data directly from DOM memory (more reliable than .text)
+        # Initial wait for any value to appear
+        try:
+            WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
+        except:
+            log("   ⏳ Timeout waiting for values, trying JS extraction anyway...")
+
+        # Multi-stage extraction
+        for attempt in range(5):
+            # JS pulls directly from the element's innerText
             js = "return Array.from(document.querySelectorAll(\"[class*='valueValue'], [class*='value-']\")).map(el => el.innerText.trim()).filter(txt => txt.length > 0);"
             vals = drv.execute_script(js)
+            
             if len(vals) >= EXPECTED_COUNT:
                 return vals[:EXPECTED_COUNT]
             
-            # Slow scroll to trigger lazy loading
-            drv.execute_script("window.scrollBy(0, 500);")
-            time.sleep(3)
+            # If 0 values, wait longer (Anti-Bot or Slow Load)
+            if not vals:
+                time.sleep(4)
+            
+            drv.execute_script(f"window.scrollBy(0, 450);")
+            time.sleep(2.5)
+            
         return vals
-    except:
+    except Exception as e:
+        log(f"   ❌ Driver Error: {str(e)[:50]}")
         return []
 
 # ---------------- MAIN ---------------- #
@@ -119,39 +128,42 @@ def run_cleanup():
     loop_end = min(END_ROW, len(all_data))
     
     for i in range(START_ROW, loop_end):
-        if i == 0: continue # Skip header
+        if i == 0: continue
         
         row = all_data[i]
         symbol = row[0].strip()
-        status = row[STATUS_COL_IDX - 1].strip().upper() if len(row) >= STATUS_COL_IDX else ""
         
-        # TARGET: Anything that isn't 'OK'
+        # Carefully check Column Y (Index 24 in 0-based list)
+        status = row[STATUS_COL_IDX - 1].strip() if len(row) >= STATUS_COL_IDX else ""
+        
+        # PROCESS: If NOT OK or completely BLANK
         if status != "OK":
             url = url_map.get(symbol)
-            if not url: continue
+            if not url:
+                continue
 
-            log(f"🛠️ Cleansing Row {i+1} [{symbol}] | Current Status: {status if status else 'BLANK'}")
+            log(f"🛠️ Checking Row {i+1} [{symbol}] (Status: {status if status else 'EMPTY'})")
             new_vals = aggressive_scrape(driver, url)
 
             if len(new_vals) >= EXPECTED_COUNT:
-                # Update cells one by one with a delay to prevent 429 Quota errors
+                # Update data range
                 api_retry(sh_data.update, [new_vals], f"{DATA_START_LETTER}{i+1}:{DATA_END_LETTER}{i+1}")
-                time.sleep(2) 
+                time.sleep(2)
                 
+                # Set Status to OK
                 api_retry(sh_data.update_cell, i+1, STATUS_COL_IDX, "OK")
-                log(f"   ✅ Successfully Fixed!")
+                log(f"   ✅ Fixed and marked OK!")
                 fixed_count += 1
-                time.sleep(3) # Extra cooldown
+                time.sleep(3)
             else:
-                log(f"   ⚠️ Still incomplete ({len(new_vals)}/26 values found)")
+                log(f"   ⚠️ Could only find {len(new_vals)} values. Skipping update to avoid blanking.")
 
-        # Refresh browser periodically to keep memory clean
-        if (i + 1) % 20 == 0:
+        if (i + 1) % 25 == 0:
             driver.quit()
             driver = create_driver()
 
     driver.quit()
-    log(f"🏁 Cleanser Shard {SHARD_INDEX} complete. Total fixed: {fixed_count}")
+    log(f"🏁 Cleanser Shard {SHARD_INDEX} complete. Fixed: {fixed_count}")
 
 if __name__ == "__main__":
     run_cleanup()
