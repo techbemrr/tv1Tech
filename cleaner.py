@@ -47,7 +47,7 @@ def api_retry(func, *args, **kwargs):
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
-        except Exception:
+        except:
             wait = (2 ** attempt) + random.random()
             log(f"⚠️ API retry in {wait:.1f}s...")
             time.sleep(wait)
@@ -160,36 +160,38 @@ def find_not_ok_rows(sheet_data, company_list):
 
     indices = []
 
-    for i, val in enumerate(status_values[1:], start=1):
-        if val.strip().upper() == "NOT OK":
-            name = company_list[i - 1].strip() if i-1 < len(company_list) else "UNKNOWN"
-            log(f"❌ Found NOT OK → Row {i} | {name}")
-            indices.append(i)
+    for i in range(1, len(status_values)):  # skip header
+        if status_values[i].strip().upper() == "NOT OK":
+            sheet_row = i + 1  # actual row number
+            name = company_list[i].strip() if i < len(company_list) else "UNKNOWN"
+
+            log(f"❌ Found NOT OK → Row {sheet_row} | {name}")
+            indices.append(sheet_row)
 
     log(f"⚠️ Total NOT OK rows: {len(indices)}")
     return indices
 
 # ---------------- PROCESS ---------------- #
-def process_row(i, company_list, url_list, current_date):
-    name = company_list[i - 1].strip()
-    url = url_list[i - 1].strip() if "http" in url_list[i - 1] else None
+def process_row(sheet_row, company_list, url_list, current_date):
+    idx = sheet_row - 1  # convert to list index
 
-    log(f"🚀 Processing → Row {i} | {name}")
+    name = company_list[idx].strip()
+    url = url_list[idx].strip() if "http" in url_list[idx] else None
+
+    log(f"🚀 Processing → Row {sheet_row} | {name}")
 
     vals, status, sheet_url, browser_url = scrape_day(url)
 
     filled = sum(1 for v in vals if v.strip())
     log(f"📊 Result → {name} | {filled}/{EXPECTED_COUNT} | {status}")
 
-    row_idx = i
-
     return [
-        {"range": f"A{row_idx}", "values": [[name]]},
-        {"range": f"B{row_idx}", "values": [[current_date]]},
-        {"range": f"{DAY_START_COL_LETTER}{row_idx}:{DAY_END_COL_LETTER}{row_idx}", "values": [vals]},
-        {"range": f"{STATUS_COL}{row_idx}", "values": [[status]]},
-        {"range": f"{SHEET_URL_COL}{row_idx}", "values": [[sheet_url]]},
-        {"range": f"{BROWSER_URL_COL}{row_idx}", "values": [[browser_url]]}
+        {"range": f"A{sheet_row}", "values": [[name]]},
+        {"range": f"B{sheet_row}", "values": [[current_date]]},
+        {"range": f"{DAY_START_COL_LETTER}{sheet_row}:{DAY_END_COL_LETTER}{sheet_row}", "values": [vals]},
+        {"range": f"{STATUS_COL}{sheet_row}", "values": [[status]]},
+        {"range": f"{SHEET_URL_COL}{sheet_row}", "values": [[sheet_url]]},
+        {"range": f"{BROWSER_URL_COL}{sheet_row}", "values": [[browser_url]]}
     ]
 
 # ---------------- MAIN ---------------- #
@@ -211,10 +213,10 @@ def main():
 
     total = len(not_ok_rows)
 
-    for idx, i in enumerate(not_ok_rows):
+    for idx, row in enumerate(not_ok_rows):
         log(f"🔄 Progress: {idx+1}/{total}")
 
-        batch.extend(process_row(i, company_list, url_list, current_date))
+        batch.extend(process_row(row, company_list, url_list, current_date))
 
         if (idx + 1) % 10 == 0:
             restart_driver()
