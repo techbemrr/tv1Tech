@@ -1,19 +1,13 @@
 name: TradingView Sharded Scraper cleaner
 
 on:
-  workflow_dispatch: # Allows manual trigger
+  workflow_dispatch: # Allows you to run it manually whenever you see blanks
   schedule:
-    - cron: '0 0 * * *' # Runs daily at midnight
+    - cron: '30 2 * * *' # Example: Runs 2.5 hours after your main scraper starts
 
 jobs:
-  scrape:
+  cleanup:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # 5 Shards: 0 (0-499), 1 (500-999), 2 (1000-1499), 3 (1500-1999), 4 (2000-2499)
-        shard: [0, 1, 2, 3, 4]
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -30,19 +24,25 @@ jobs:
 
       - name: Create Credentials and Cookies
         run: |
-          echo '${{ secrets.GSPREAD_JSON }}' > credentials.json
-          echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
+          # This method prevents the JSONDecodeError by preserving the JSON structure
+          cat <<EOF > credentials.json
+          ${{ secrets.GSPREAD_JSON }}
+          EOF
+          
+          cat <<EOF > cookies.json
+          ${{ secrets.TRADINGVIEW_COOKIES }}
+          EOF
 
-      - name: Run Scraper Shard
+      - name: Run Cleaner Script
         env:
-          SHARD_INDEX: ${{ matrix.shard }}
-          SHARD_SIZE: 500
-          CHECKPOINT_FILE: "checkpoint_day_${{ matrix.shard }}.txt"
+          # Keeping these here in case your cleaner.py logic uses them for logging
+          SHARD_INDEX: 0
+          SHARD_SIZE: 2500
         run: python cleaner.py
 
-      - name: Save Checkpoint
+      - name: Upload Logs (Optional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: checkpoint-shard-${{ matrix.shard }}
-          path: checkpoint_day_${{ matrix.shard }}.txt
+          name: cleanup-log
+          path: "*.txt" # Captures any logs or checkpoints if generated
