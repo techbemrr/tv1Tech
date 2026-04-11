@@ -18,9 +18,9 @@ def log(msg):
     print(f"[{t}] {msg}", flush=True)
 
 # ---------------- CONFIG ---------------- #
-# Using same env vars as your main YML
+# Matches your YML shard setup
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_SIZE = int(os.getenv("SHARD_SIZE", "510")) # Adjusted to match your YML total
+SHARD_SIZE = int(os.getenv("SHARD_SIZE", "510")) 
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 
@@ -38,15 +38,23 @@ def col_num_to_letter(n):
         result = chr(65 + rem) + result
     return result
 
-# Mapping columns for update
 STATUS_COL_IDX = DAY_OUTPUT_START_COL + EXPECTED_COUNT
-STATUS_COL_LETTER = col_num_to_letter(STATUS_COL_IDX)
 DATA_START_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL)
 DATA_END_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT - 1)
 
+def api_retry(func, *args, **kwargs):
+    for attempt in range(5):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            wait = (attempt * 2) + 5 
+            log(f"⚠️ API Issue: {str(e)[:50]}. Waiting {wait}s...")
+            time.sleep(wait)
+    return None
+
 # ---------------- DRIVER ---------------- #
 def create_driver():
-    log(f"🌐 [CLEANER Shard {SHARD_INDEX}] Initializing...")
+    log(f"🌐 [CLEANSER Shard {SHARD_INDEX}] Initializing...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -72,17 +80,22 @@ def create_driver():
 def aggressive_scrape(drv, url):
     try:
         drv.get(url)
+        # Force browser to zoom out so more data is "visible" for the scraper
         drv.execute_script("document.body.style.zoom='50%'")
-        WebDriverWait(drv, 25).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
         
-        # High intensity wait/scroll
+        # Longer wait for the data container
+        WebDriverWait(drv, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
+        
         for _ in range(4):
+            # JS script pulls data directly from DOM memory (more reliable than .text)
             js = "return Array.from(document.querySelectorAll(\"[class*='valueValue'], [class*='value-']\")).map(el => el.innerText.trim()).filter(txt => txt.length > 0);"
             vals = drv.execute_script(js)
             if len(vals) >= EXPECTED_COUNT:
                 return vals[:EXPECTED_COUNT]
-            drv.execute_script("window.scrollBy(0, 400);")
-            time.sleep(2.5)
+            
+            # Slow scroll to trigger lazy loading
+            drv.execute_script("window.scrollBy(0, 500);")
+            time.sleep(3)
         return vals
     except:
         return []
@@ -93,48 +106,52 @@ def run_cleanup():
     sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
     sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
 
-    # Load all data to minimize API hits
     log("📥 Fetching sheet data...")
     all_data = sh_data.get_all_values()
     stock_list = sh_main.get_all_values()
     
-    # Map Symbol to URL (Column 1 to Column 4)
+    # Map Symbol to URL
     url_map = {row[0].strip(): row[3].strip() for row in stock_list if len(row) > 3}
 
     driver = create_driver()
     fixed_count = 0
     
-    # Define range based on Shard
     loop_end = min(END_ROW, len(all_data))
     
     for i in range(START_ROW, loop_end):
         if i == 0: continue # Skip header
+        
         row = all_data[i]
         symbol = row[0].strip()
-        status = row[STATUS_COL_IDX - 1] if len(row) >= STATUS_COL_IDX else ""
+        status = row[STATUS_COL_IDX - 1].strip().upper() if len(row) >= STATUS_COL_IDX else ""
         
+        # TARGET: Anything that isn't 'OK'
         if status != "OK":
             url = url_map.get(symbol)
             if not url: continue
 
-            log(f"🛠️ Fixing Row {i+1} [{symbol}]")
+            log(f"🛠️ Cleansing Row {i+1} [{symbol}] | Current Status: {status if status else 'BLANK'}")
             new_vals = aggressive_scrape(driver, url)
 
             if len(new_vals) >= EXPECTED_COUNT:
-                # Update data and status
-                sh_data.update(f"{DATA_START_LETTER}{i+1}:{DATA_END_LETTER}{i+1}", [new_vals])
-                sh_data.update_cell(i+1, STATUS_COL_IDX, "OK")
-                log(f"✅ Fixed!")
+                # Update cells one by one with a delay to prevent 429 Quota errors
+                api_retry(sh_data.update, [new_vals], f"{DATA_START_LETTER}{i+1}:{DATA_END_LETTER}{i+1}")
+                time.sleep(2) 
+                
+                api_retry(sh_data.update_cell, i+1, STATUS_COL_IDX, "OK")
+                log(f"   ✅ Successfully Fixed!")
                 fixed_count += 1
+                time.sleep(3) # Extra cooldown
             else:
-                log(f"⚠️ Still failed ({len(new_vals)} values found)")
+                log(f"   ⚠️ Still incomplete ({len(new_vals)}/26 values found)")
 
+        # Refresh browser periodically to keep memory clean
         if (i + 1) % 20 == 0:
             driver.quit()
             driver = create_driver()
 
     driver.quit()
-    log(f"🏁 Cleanup Shard {SHARD_INDEX} complete. Fixed: {fixed_count}")
+    log(f"🏁 Cleanser Shard {SHARD_INDEX} complete. Total fixed: {fixed_count}")
 
 if __name__ == "__main__":
     run_cleanup()
