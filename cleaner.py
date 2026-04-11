@@ -47,7 +47,7 @@ def api_retry(func, *args, **kwargs):
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
-        except:
+        except Exception as e:
             wait = (2 ** attempt) + random.random()
             log(f"⚠️ API retry in {wait:.1f}s...")
             time.sleep(wait)
@@ -162,7 +162,7 @@ def find_not_ok_rows(sheet_data, company_list):
 
     for i in range(1, len(status_values)):  # skip header
         if status_values[i].strip().upper() == "NOT OK":
-            sheet_row = i + 1  # actual row number
+            sheet_row = i + 1
             name = company_list[i].strip() if i < len(company_list) else "UNKNOWN"
 
             log(f"❌ Found NOT OK → Row {sheet_row} | {name}")
@@ -171,25 +171,50 @@ def find_not_ok_rows(sheet_data, company_list):
     log(f"⚠️ Total NOT OK rows: {len(indices)}")
     return indices
 
+# ---------------- MERGE ---------------- #
+def merge_values(old_vals, new_vals):
+    merged = []
+    for old, new in zip(old_vals, new_vals):
+        merged.append(new if new.strip() else old)
+    return merged
+
 # ---------------- PROCESS ---------------- #
-def process_row(sheet_row, company_list, url_list, current_date):
-    idx = sheet_row - 1  # convert to list index
+def process_row(sheet_row, company_list, url_list, sheet_data, current_date):
+    idx = sheet_row - 1
 
     name = company_list[idx].strip()
     url = url_list[idx].strip() if "http" in url_list[idx] else None
 
     log(f"🚀 Processing → Row {sheet_row} | {name}")
 
-    vals, status, sheet_url, browser_url = scrape_day(url)
+    # OLD VALUES
+    old_vals = api_retry(sheet_data.row_values, sheet_row)
+    old_day_vals = old_vals[DAY_OUTPUT_START_COL - 1 : DAY_OUTPUT_START_COL - 1 + EXPECTED_COUNT]
 
-    filled = sum(1 for v in vals if v.strip())
-    log(f"📊 Result → {name} | {filled}/{EXPECTED_COUNT} | {status}")
+    # SCRAPE
+    new_vals, status, sheet_url, browser_url = scrape_day(url)
+
+    # SAFE MERGE
+    final_vals = merge_values(old_day_vals, new_vals)
+
+    filled = sum(1 for v in final_vals if v.strip())
+    final_status = "OK" if filled == EXPECTED_COUNT else "NOT OK"
+
+    log(f"📊 Result → {name} | {filled}/{EXPECTED_COUNT} | {final_status}")
+
+    # ⚡ LIVE STATUS UPDATE
+    try:
+        api_retry(
+            sheet_data.update,
+            f"{STATUS_COL}{sheet_row}",
+            [[final_status]]
+        )
+        log(f"⚡ STATUS UPDATED → {name} = {final_status}")
+    except:
+        log(f"⚠️ STATUS UPDATE FAILED → {name}")
 
     return [
-        {"range": f"A{sheet_row}", "values": [[name]]},
-        {"range": f"B{sheet_row}", "values": [[current_date]]},
-        {"range": f"{DAY_START_COL_LETTER}{sheet_row}:{DAY_END_COL_LETTER}{sheet_row}", "values": [vals]},
-        {"range": f"{STATUS_COL}{sheet_row}", "values": [[status]]},
+        {"range": f"{DAY_START_COL_LETTER}{sheet_row}:{DAY_END_COL_LETTER}{sheet_row}", "values": [final_vals]},
         {"range": f"{SHEET_URL_COL}{sheet_row}", "values": [[sheet_url]]},
         {"range": f"{BROWSER_URL_COL}{sheet_row}", "values": [[browser_url]]}
     ]
@@ -216,7 +241,7 @@ def main():
     for idx, row in enumerate(not_ok_rows):
         log(f"🔄 Progress: {idx+1}/{total}")
 
-        batch.extend(process_row(row, company_list, url_list, current_date))
+        batch.extend(process_row(row, company_list, url_list, sheet_data, current_date))
 
         if (idx + 1) % 10 == 0:
             restart_driver()
