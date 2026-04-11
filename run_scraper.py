@@ -122,9 +122,26 @@ def restart_driver():
 # ---------------- SCRAPER ---------------- #
 def get_values(drv):
     try:
-        # Improved selector to be more specific to value containers
-        elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue'], span[class*='valueValue']")
-        vals = [el.text.strip() for el in elements if el.text.strip()]
+        # Strategy 1: Standard Selenium with expanded selectors
+        selectors = [
+            "div[class*='valueValue']", 
+            "span[class*='valueValue']",
+            "div[class*='value-']",
+            "span[class*='value-']"
+        ]
+        
+        # Strategy 2: JavaScript Execution (Often bypasses rendering delays)
+        js_script = """
+        return Array.from(document.querySelectorAll("[class*='valueValue'], [class*='value-']"))
+                    .map(el => el.innerText.trim())
+                    .filter(txt => txt.length > 0);
+        """
+        vals = drv.execute_script(js_script)
+        
+        if not vals:
+            elements = drv.find_elements(By.CSS_SELECTOR, ", ".join(selectors))
+            vals = [el.text.strip() for el in elements if el.text.strip()]
+            
         return vals
     except Exception as e:
         log(f"   get_values error: {e}")
@@ -139,28 +156,22 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # Wait for the container, but also implement a loop to wait for text values
-            wait = WebDriverWait(drv, 25)
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
+            # Zoom out to 50% to force more elements to load into view
+            drv.execute_script("document.body.style.zoom='50%'")
             
-            # Smart Wait: Check every 1s for up to 5s if values are actually appearing
+            wait = WebDriverWait(drv, 25)
+            # Wait for any element that looks like a data value
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
+            
             vals = []
-            for _ in range(5):
+            # Intensive check loop
+            for _ in range(6):
                 vals = get_values(drv)
                 if len(vals) >= EXPECTED_COUNT:
                     break
+                # Smaller scroll increments to trigger lazy-loaders
+                drv.execute_script("window.scrollBy(0, 300);")
                 time.sleep(1.5)
-
-            # Scroll logic if still not enough
-            if len(vals) < EXPECTED_COUNT:
-                for scroll_y in [600, 1200, 1800]:
-                    drv.execute_script(f"window.scrollTo(0, {scroll_y});")
-                    time.sleep(1.2)
-                    new_vals = get_values(drv)
-                    if len(new_vals) > len(vals):
-                        vals = new_vals
-                    if len(vals) >= EXPECTED_COUNT:
-                        break
 
             browser_url = drv.current_url
             found_count = len(vals)
@@ -171,7 +182,7 @@ def scrape_day(url):
                 padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
                 return padded_vals, f"Partial ({found_count})", url, browser_url
             else:
-                log(f"   ⚠️ Blank values on attempt {attempt+1}")
+                log(f"   ⚠️ Row returned 0 values on attempt {attempt+1}")
                 if attempt == 0: 
                     restart_driver() # Force fresh session for retry
                     
@@ -246,7 +257,7 @@ if batch_list:
 retry_attempt = 1
 while failed_queue and retry_attempt <= MAX_RETRIES:
     log(f"🔁 Starting Retry Pass {retry_attempt} for {len(failed_queue)} symbols...")
-    time.sleep(random.randint(10, 20))
+    time.sleep(random.randint(15, 25))
     restart_driver()
     
     still_failing = []
