@@ -1,13 +1,14 @@
 name: TradingView Sharded Scraper cleaner
 
 on:
-  workflow_dispatch: # Allows you to run it manually whenever you see blanks
+  workflow_dispatch: # Allows manual trigger from the Actions tab
   schedule:
-    - cron: '30 2 * * *' # Example: Runs 2.5 hours after your main scraper starts
+    - cron: '30 2 * * *' # Runs daily at 2:30 AM
 
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,26 +24,29 @@ jobs:
           pip install selenium webdriver-manager gspread oauth2client
 
       - name: Create Credentials and Cookies
+        shell: bash
         run: |
-          # This method prevents the JSONDecodeError by preserving the JSON structure
-          cat <<EOF > credentials.json
-          ${{ secrets.GSPREAD_JSON }}
-          EOF
+          # Print the secret directly into the file to avoid shell interpretation issues
+          printf '%s' '${{ secrets.GSPREAD_JSON }}' > credentials.json
+          printf '%s' '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
           
-          cat <<EOF > cookies.json
-          ${{ secrets.TRADINGVIEW_COOKIES }}
-          EOF
+          # Log verification for debugging
+          if [ -s credentials.json ]; then
+            echo "✅ credentials.json created (Size: $(stat -c%s credentials.json) bytes)"
+          else
+            echo "❌ credentials.json is EMPTY. Check GitHub Secrets!"
+            exit 1
+          fi
 
       - name: Run Cleaner Script
         env:
-          # Keeping these here in case your cleaner.py logic uses them for logging
           SHARD_INDEX: 0
           SHARD_SIZE: 2500
         run: python cleaner.py
 
-      - name: Upload Logs (Optional)
+      - name: Upload Cleanup Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cleanup-log
-          path: "*.txt" # Captures any logs or checkpoints if generated
+          name: cleanup-report
+          path: "*.txt"
