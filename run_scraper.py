@@ -27,11 +27,10 @@ checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.tx
 EXPECTED_COUNT = 26
 BATCH_SIZE = 100
 RESTART_EVERY_ROWS = 20
-MAX_RETRIES = 2  
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-DAY_OUTPUT_START_COL = 3  
+DAY_OUTPUT_START_COL = 3  # Data starts in Column C
 
 # ---------------- UTILS ---------------- #
 def col_num_to_letter(n):
@@ -122,26 +121,8 @@ def restart_driver():
 # ---------------- SCRAPER ---------------- #
 def get_values(drv):
     try:
-        # Strategy 1: Standard Selenium with expanded selectors
-        selectors = [
-            "div[class*='valueValue']", 
-            "span[class*='valueValue']",
-            "div[class*='value-']",
-            "span[class*='value-']"
-        ]
-        
-        # Strategy 2: JavaScript Execution (Often bypasses rendering delays)
-        js_script = """
-        return Array.from(document.querySelectorAll("[class*='valueValue'], [class*='value-']"))
-                    .map(el => el.innerText.trim())
-                    .filter(txt => txt.length > 0);
-        """
-        vals = drv.execute_script(js_script)
-        
-        if not vals:
-            elements = drv.find_elements(By.CSS_SELECTOR, ", ".join(selectors))
-            vals = [el.text.strip() for el in elements if el.text.strip()]
-            
+        elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
+        vals = [el.text.strip() for el in elements if el.text.strip()]
         return vals
     except Exception as e:
         log(f"   get_values error: {e}")
@@ -155,47 +136,39 @@ def scrape_day(url):
         try:
             drv = ensure_driver()
             drv.get(url)
-            
-            # Zoom out to 50% to force more elements to load into view
-            drv.execute_script("document.body.style.zoom='50%'")
-            
-            wait = WebDriverWait(drv, 25)
-            # Wait for any element that looks like a data value
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
-            
-            vals = []
-            # Intensive check loop
-            for _ in range(6):
-                vals = get_values(drv)
-                if len(vals) >= EXPECTED_COUNT:
-                    break
-                # Smaller scroll increments to trigger lazy-loaders
-                drv.execute_script("window.scrollBy(0, 300);")
-                time.sleep(1.5)
+            wait = WebDriverWait(drv, 20)
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='valueValue']")))
+            time.sleep(2)
+            vals = get_values(drv)
+
+            if len(vals) < EXPECTED_COUNT:
+                for scroll_y in [500, 1000, 1500, 2000]:
+                    drv.execute_script(f"window.scrollTo(0, {scroll_y});")
+                    time.sleep(1.5)
+                    new_vals = get_values(drv)
+                    if len(new_vals) > len(vals):
+                        vals = new_vals
+                    if len(vals) >= EXPECTED_COUNT:
+                        break
 
             browser_url = drv.current_url
             found_count = len(vals)
-            
             if found_count >= EXPECTED_COUNT:
+                log(f"   Found {found_count} values")
                 return vals[:EXPECTED_COUNT], "OK", url, browser_url
-            elif found_count > 0:
-                padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
-                return padded_vals, f"Partial ({found_count})", url, browser_url
             else:
-                log(f"   ⚠️ Row returned 0 values on attempt {attempt+1}")
-                if attempt == 0: 
-                    restart_driver() # Force fresh session for retry
-                    
+                log(f"   ⚠️ Only found {found_count} values")
+                padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
+                return padded_vals, f"Only {found_count} Found", url, browser_url
         except Exception as e:
             log(f"   ❌ Scrape Attempt {attempt + 1} Failed: {str(e)[:50]}")
             restart_driver()
-            
-    return [""] * EXPECTED_COUNT, "EMPTY", url, ""
+    return [""] * EXPECTED_COUNT, "Failed", url, ""
 
 # ---------------- MAIN ---------------- #
 def connect_sheets():
     gc = gspread.service_account("credentials.json")
-    sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
+    sh_main = gc.open("Stock List").worksheet("Sheet1")
     sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
     return sh_main, sh_data
 
@@ -215,8 +188,7 @@ def process_row(i, company_list, url_list, current_date):
         {"range": f"{SHEET_URL_COL}{row_idx}", "values": [[sheet_url_used]]},
         {"range": f"{BROWSER_URL_COL}{row_idx}", "values": [[browser_url_used]]}
     ]
-    is_success = (status == "OK")
-    return row_payload, is_success
+    return row_payload, (status == "OK")
 
 try:
     sheet_main, sheet_data = connect_sheets()
@@ -227,60 +199,54 @@ except Exception as e:
     log(f"❌ Initial Connection Error: {e}")
     sys.exit(1)
 
-failed_queue = []
+retry_indices = []
 batch_list = []
 current_date = date.today().strftime("%m/%d/%Y")
 loop_end = min(END_ROW, len(company_list))
 
-for i in range(last_i, loop_end):
-    payload, success = process_row(i, company_list, url_list, current_date)
-    batch_list.extend(payload)
-    
-    if not success:
-        failed_queue.append(i)
-
-    with open(checkpoint_file, "w") as f:
-        f.write(str(i + 1))
-
-    if (i + 1) % RESTART_EVERY_ROWS == 0:
-        restart_driver()
-
-    if len(batch_list) // 6 >= BATCH_SIZE:
-        log(f"🚀 Uploading batch of {BATCH_SIZE} rows...")
-        api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
-        batch_list = []
-
-if batch_list:
-    api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
-    batch_list = []
-
-retry_attempt = 1
-while failed_queue and retry_attempt <= MAX_RETRIES:
-    log(f"🔁 Starting Retry Pass {retry_attempt} for {len(failed_queue)} symbols...")
-    time.sleep(random.randint(15, 25))
-    restart_driver()
-    
-    still_failing = []
-    for idx, i in enumerate(failed_queue):
+# --- FIRST PASS ---
+try:
+    for i in range(last_i, loop_end):
         payload, success = process_row(i, company_list, url_list, current_date)
         batch_list.extend(payload)
         
         if not success:
-            still_failing.append(i)
-            
-        if (idx + 1) % 10 == 0:
+            retry_indices.append(i)
+
+        with open(checkpoint_file, "w") as f:
+            f.write(str(i + 1))
+
+        if (i + 1) % RESTART_EVERY_ROWS == 0:
+            restart_driver()
+
+        if len(batch_list) // 6 >= BATCH_SIZE:
+            log(f"🚀 Uploading batch of {BATCH_SIZE} rows...")
+            api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+            batch_list = []
+
+finally:
+    if batch_list:
+        api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+        batch_list = []
+
+# --- SECOND PASS (RETRIES) ---
+if retry_indices:
+    log(f"🔁 Starting Retry Pass for {len(retry_indices)} symbols...")
+    restart_driver() # Fresh start for retries
+    
+    for idx, i in enumerate(retry_indices):
+        payload, success = process_row(i, company_list, url_list, current_date)
+        batch_list.extend(payload)
+        
+        if (idx + 1) % 10 == 0: # Restart driver more frequently on retries
             restart_driver()
             
-        if len(batch_list) // 6 >= 10:
+        if len(batch_list) // 6 >= 10: # Smaller batch for retries
             api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
             batch_list = []
 
     if batch_list:
         api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
-        batch_list = []
-        
-    failed_queue = still_failing
-    retry_attempt += 1
 
 restart_driver()
-log("🏁 DAY SHARD COMPLETED.")
+log("🏁 DAY SHARD COMPLETED (Including Retries).")
