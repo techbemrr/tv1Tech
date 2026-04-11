@@ -66,17 +66,17 @@ def create_driver():
 
     drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
 
-    if COOKIE_FILE:
-        try:
-            drv.get("https://in.tradingview.com/")
-            with open(COOKIE_FILE, "r") as f:
-                cookies = json.load(f)
-            for c in cookies:
-                drv.add_cookie({k: v for k, v in c.items() if k in ("name","value","path","secure","expiry")})
-            drv.refresh()
-            time.sleep(2)
-        except:
-            pass
+    # Load cookies (optional)
+    try:
+        drv.get("https://in.tradingview.com/")
+        with open(COOKIE_FILE, "r") as f:
+            cookies = json.load(f)
+        for c in cookies:
+            drv.add_cookie({k: v for k, v in c.items() if k in ("name","value","path","secure","expiry")})
+        drv.refresh()
+        time.sleep(2)
+    except:
+        pass
 
     return drv
 
@@ -104,7 +104,7 @@ def scrape_day(url):
     if not url:
         return [""] * EXPECTED_COUNT, "NOT OK", "", ""
 
-    for _ in range(2):
+    for attempt in range(2):
         try:
             drv = ensure_driver()
             drv.get(url)
@@ -120,19 +120,25 @@ def scrape_day(url):
                 for y in [600, 1200, 2000]:
                     drv.execute_script(f"window.scrollTo(0, {y});")
                     time.sleep(1.5)
-                    vals = get_values(drv)
+                    new_vals = get_values(drv)
+                    if len(new_vals) > len(vals):
+                        vals = new_vals
                     if len(vals) >= EXPECTED_COUNT:
                         break
 
             browser_url = drv.current_url
+            count = len(vals)
 
-            if len(vals) >= EXPECTED_COUNT:
+            if count >= EXPECTED_COUNT:
+                log(f"   ✅ Found {count}/{EXPECTED_COUNT}")
                 return vals[:EXPECTED_COUNT], "OK", url, browser_url
             else:
+                log(f"   ⚠️ Found {count}/{EXPECTED_COUNT}")
                 padded = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
                 return padded, "NOT OK", url, browser_url
 
         except:
+            log(f"   ❌ Attempt {attempt+1} failed, restarting browser...")
             restart_driver()
 
     return [""] * EXPECTED_COUNT, "NOT OK", url, ""
@@ -145,8 +151,8 @@ def connect_sheets():
     return sh_main, sh_data
 
 # ---------------- FIND NOT OK ---------------- #
-def find_not_ok_rows(sheet_data):
-    log("🔍 Finding NOT OK rows...")
+def find_not_ok_rows(sheet_data, company_list):
+    log("🔍 Scanning for NOT OK rows...")
 
     status_values = api_retry(
         sheet_data.col_values,
@@ -154,11 +160,14 @@ def find_not_ok_rows(sheet_data):
     )
 
     indices = []
+
     for i, val in enumerate(status_values[1:], start=1):
         if val.strip().upper() == "NOT OK":
+            name = company_list[i].strip() if i < len(company_list) else "UNKNOWN"
+            log(f"❌ Found NOT OK → Row {i+1} | {name}")
             indices.append(i)
 
-    log(f"⚠️ Found {len(indices)} rows")
+    log(f"⚠️ Total NOT OK rows: {len(indices)}")
     return indices
 
 # ---------------- PROCESS ---------------- #
@@ -166,9 +175,12 @@ def process_row(i, company_list, url_list, current_date):
     name = company_list[i].strip()
     url = url_list[i].strip() if "http" in url_list[i] else None
 
-    log(f"🔁 Fixing [{i+1}] {name}")
+    log(f"🚀 Processing → Row {i+1} | {name}")
 
     vals, status, sheet_url, browser_url = scrape_day(url)
+
+    filled = sum(1 for v in vals if v.strip())
+    log(f"📊 Result → {name} | {filled}/{EXPECTED_COUNT} | {status}")
 
     row_idx = i + 1
 
@@ -188,7 +200,7 @@ def main():
     company_list = api_retry(sheet_main.col_values, 1)
     url_list = api_retry(sheet_main.col_values, 4)
 
-    not_ok_rows = find_not_ok_rows(sheet_data)
+    not_ok_rows = find_not_ok_rows(sheet_data, company_list)
 
     if not not_ok_rows:
         log("✅ No NOT OK rows found")
@@ -198,19 +210,25 @@ def main():
     batch = []
     current_date = date.today().strftime("%m/%d/%Y")
 
+    total = len(not_ok_rows)
+
     for idx, i in enumerate(not_ok_rows):
+        log(f"🔄 Progress: {idx+1}/{total}")
+
         batch.extend(process_row(i - 1, company_list, url_list, current_date))
 
         if (idx + 1) % 10 == 0:
             restart_driver()
+            log("🚀 Uploading batch...")
             api_retry(sheet_data.batch_update, batch, value_input_option="RAW")
             batch = []
 
     if batch:
+        log("🚀 Final upload...")
         api_retry(sheet_data.batch_update, batch, value_input_option="RAW")
 
     restart_driver()
-    log("🏁 CLEANER COMPLETED")
+    log("🏁 CLEANER COMPLETED SUCCESSFULLY")
 
 # ---------------- RUN ---------------- #
 if __name__ == "__main__":
