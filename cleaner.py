@@ -2,6 +2,7 @@ import time
 import json
 import random
 import os
+import sys
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -17,7 +18,6 @@ def log(msg):
 
 # ---------------- CONFIG ---------------- #
 EXPECTED_COUNT = 26
-# These file names must match the YAML output filenames
 COOKIE_FILE = "cookies.json"
 CREDS_FILE = "credentials.json"
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
@@ -31,18 +31,15 @@ DATA_END_COL = "AB"
 
 # ---------------- DRIVER ---------------- #
 def create_driver():
-    log("🌐 Initializing High-Intensity Cleanup Browser...")
+    log("🌐 Initializing Browser...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     
     drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
     
-    # Load Cookies if file exists and is valid
     if os.path.exists(COOKIE_FILE):
         try:
             drv.get("https://in.tradingview.com/")
@@ -52,109 +49,91 @@ def create_driver():
                 cookie_data = {k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")}
                 drv.add_cookie(cookie_data)
             drv.refresh()
-            time.sleep(2)
         except Exception as e:
-            log(f"⚠️ Cookie loading skipped: {e}")
+            log(f"⚠️ Cookie Warning: {e}")
             
     return drv
 
 # ---------------- SCRAPER ---------------- #
-def get_values_js(drv):
-    js_script = """
-    return Array.from(document.querySelectorAll("[class*='valueValue'], [class*='value-']"))
-                .map(el => el.innerText.trim())
-                .filter(txt => txt.length > 0);
-    """
-    return drv.execute_script(js_script)
-
 def aggressive_scrape(drv, url):
     try:
         drv.get(url)
         drv.execute_script("document.body.style.zoom='50%'")
+        WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
         
-        # Long wait for elements to appear
-        wait = WebDriverWait(drv, 30)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='value']")))
-        
-        vals = []
-        for i in range(5):
-            vals = get_values_js(drv)
+        for i in range(4):
+            js_script = 'return Array.from(document.querySelectorAll("[class*=\'valueValue\'], [class*=\'value-\']")).map(el => el.innerText.trim()).filter(txt => txt.length > 0);'
+            vals = drv.execute_script(js_script)
             if len(vals) >= EXPECTED_COUNT:
                 return vals[:EXPECTED_COUNT]
-            
-            drv.execute_script(f"window.scrollTo(0, {(i+1)*400});")
-            time.sleep(3) 
-            
+            drv.execute_script(f"window.scrollBy(0, 400);")
+            time.sleep(2)
         return vals
     except Exception as e:
-        log(f"   ❌ Scrape Error: {str(e)[:50]}")
+        log(f"   ❌ Scrape Failed: {str(e)[:50]}")
         return []
 
 # ---------------- MAIN CLEANUP ---------------- #
 def run_cleanup():
-    # Verify Credentials file
+    log("🚀 Starting Cleanup Process...")
+    
     if not os.path.exists(CREDS_FILE):
-        log(f"❌ Error: {CREDS_FILE} not found. Check GitHub Secrets.")
+        log(f"❌ CRITICAL: {CREDS_FILE} is missing!")
         return
 
-    # Connect to Sheets
     try:
+        log(f"🔑 Attempting to authenticate with {CREDS_FILE}...")
         gc = gspread.service_account(filename=CREDS_FILE)
+        
+        log("📊 Opening Worksheets...")
         sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
         sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
+        
+        log("📥 Fetching Sheet Data...")
+        all_data_rows = sh_data.get_all_values()
+        stock_list_raw = sh_main.get_all_values()
+        log(f"✅ Found {len(all_data_rows)} rows in MV2 DAY.")
     except Exception as e:
         log(f"❌ Connection Error: {e}")
+        # Debug: Print file content length to see if it's empty
+        if os.path.exists(CREDS_FILE):
+            log(f"DEBUG: {CREDS_FILE} size is {os.path.getsize(CREDS_FILE)} bytes.")
         return
 
-    log("Reading sheets and mapping URLs...")
-    all_data_rows = sh_data.get_all_values()
-    stock_list_raw = sh_main.get_all_values()
-    
-    # Map Symbol -> URL from STOCKLIST 2
     url_map = {row[0].strip(): row[3].strip() for row in stock_list_raw if len(row) > 3}
-
     driver = create_driver()
     
+    fixed_count = 0
     try:
         for i, row in enumerate(all_data_rows):
+            if i == 0: continue
             row_num = i + 1
-            if i == 0: continue # Skip header
             
             symbol = row[NAME_COL-1].strip()
-            # Handle rows that might not have a status column yet
             status = row[STATUS_COL-1] if len(row) >= STATUS_COL else "EMPTY"
             
-            # Target everything that is NOT marked "OK"
             if status != "OK":
                 url = url_map.get(symbol)
-                if not url or "http" not in url:
+                if not url:
+                    log(f"⏭️ Row {row_num} [{symbol}]: No URL found in Stocklist. Skipping.")
                     continue
 
-                log(f"🛠️ Attempting Fix [{row_num}] {symbol}")
+                log(f"🔍 Row {row_num} [{symbol}]: Status is '{status}'. Retrying...")
                 new_vals = aggressive_scrape(driver, url)
 
                 if len(new_vals) >= EXPECTED_COUNT:
-                    # Batch the update to status and data
                     sh_data.update(f"{DATA_START_COL}{row_num}:{DATA_END_COL}{row_num}", [new_vals])
                     sh_data.update_cell(row_num, STATUS_COL, "OK")
-                    sh_data.update_cell(row_num, URL_COL, url)
-                    log(f"✅ Row {row_num} Fixed.")
+                    log(f"✅ Row {row_num} [{symbol}]: Fixed successfully.")
+                    fixed_count += 1
                 else:
-                    log(f"⚠️ Row {row_num} still incomplete ({len(new_vals)} values)")
+                    log(f"⚠️ Row {row_num} [{symbol}]: Only found {len(new_vals)} values. Still failing.")
                 
-                time.sleep(random.uniform(1, 3))
+                time.sleep(1)
 
-            # Periodic browser refresh
-            if row_num % 20 == 0:
-                driver.quit()
-                driver = create_driver()
-
-    except Exception as e:
-        log(f"❌ Cleanup Loop Error: {e}")
     finally:
-        if driver:
-            driver.quit()
-        log("🏁 Cleanup Process Finished.")
+        if driver: driver.quit()
+        log(f"🏁 Cleanup Finished. Total symbols fixed: {fixed_count}")
 
 if __name__ == "__main__":
     run_cleanup()
