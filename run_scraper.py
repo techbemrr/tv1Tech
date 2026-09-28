@@ -165,7 +165,7 @@ def process_row(i, company_list, url_list, current_date):
     name = company_list[i].strip() if i < len(company_list) else ""
     url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
     
-    log(f"🔍 [{i + 1}] {name}")
+    log(f"🔍 [{i + 1}] {name} | URL: {url if url else 'No URL'}")
     vals, status, sheet_url_used, browser_url_used = scrape_day(url)
     
     row_idx = i + 1
