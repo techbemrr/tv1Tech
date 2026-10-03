@@ -3,6 +3,7 @@ import os
 import time
 import json
 import random
+import re
 from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -108,30 +109,42 @@ def restart_driver():
     driver = None
 
 # ---------------- SCRAPER ---------------- #
-def get_values(drv):
-    """Scrapes values using multiple target class selectors used by TradingView legends."""
-    selectors = [
-        "[class*='valueValue']",
-        "[class*='legendSingleValue']",
-        "[class*='valuesWrapper'] > span",
-        "[class*='value-'][class*='item-']",
-        "div[data-name='legend-source-title'] ~ div span"
-    ]
+def extract_legend_values_via_js(drv):
+    """JS script to grab text from all legend items directly from the DOM tree."""
+    js_script = """
+    let results = [];
     
-    for selector in selectors:
-        try:
-            elements = drv.find_elements(By.CSS_SELECTOR, selector)
-            vals = [el.text.strip() for el in elements if el.text.strip()]
-            if len(vals) >= EXPECTED_COUNT:
-                return vals
-        except:
-            continue
-            
-    # Fallback sweep: collect text from all dynamic value elements
+    // 1. Try finding legend values container
+    let legendContainers = document.querySelectorAll('[class*="legend-"], [class*="legendMainSource"]');
+    
+    legendContainers.forEach(container => {
+        let spans = container.querySelectorAll('span, div');
+        spans.forEach(el => {
+            let txt = el.innerText ? el.innerText.trim() : '';
+            if (txt && !results.includes(txt)) {
+                // Match numerical values or indicators
+                if (/^-?\\d+(\\.\\d+)?$/.test(txt) || txt === 'Ø') {
+                    results.push(txt);
+                }
+            }
+        });
+    });
+    
+    // 2. Fallback: Scan top-left legend overlay directly
+    if (results.length < 18) {
+        let allValues = document.querySelectorAll('[class*="value-"], [class*="valueValue"]');
+        allValues.forEach(el => {
+            let txt = el.innerText ? el.innerText.trim() : '';
+            if (txt) {
+                results.push(txt);
+            }
+        });
+    }
+    
+    return results;
+    """
     try:
-        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='value']")
-        vals = [el.text.strip() for el in elements if el.text.strip() and el.text.strip() != "Ø"]
-        return vals
+        return drv.execute_script(js_script)
     except:
         return []
 
@@ -143,41 +156,39 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # Step 1: Wait for main page DOM body to load
-            WebDriverWait(drv, 45).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            # 1. Wait for canvas or body to ensure the chart is ready
+            WebDriverWait(drv, 40).until(
+                EC.presence_of_element_located((By.TAG_NAME, "canvas"))
             )
             
-            # Step 2: Extended wait for TradingView layout and WebGL/Chart engine initialization
-            time.sleep(8)
+            # 2. Allow TradingView layout engine & WebSocket data stream to finish loading
+            time.sleep(10)
             
-            # Step 3: Ensure legend panel is expanded (clicks toggle arrow if collapsed)
+            # 3. Trigger legend expansion if collapsed
             drv.execute_script("""
-                let toggleBtn = document.querySelector('[class*="toggleButton"]');
-                if (toggleBtn && toggleBtn.getAttribute('aria-expanded') === 'false') {
-                    toggleBtn.click();
-                }
+                let arrow = document.querySelector('[class*="toggleButton"], [class*="pane-legend-icon"]');
+                if (arrow) arrow.click();
             """)
             time.sleep(2)
 
-            # Step 4: Active Polling loop for full page indicator data load (up to 30s)
+            # 4. Polling for complete legend values
             vals = []
-            max_poll_time = 30
             start_poll = time.time()
+            max_poll = 25
             
-            while time.time() - start_poll < max_poll_time:
-                vals = get_values(drv)
+            while time.time() - start_poll < max_poll:
+                vals = extract_legend_values_via_js(drv)
                 if len(vals) >= EXPECTED_COUNT:
                     break
                 
-                # Trigger hover on canvas to activate dynamic legend tooltips/values
+                # Dispatch mouse movement over canvas to activate dynamic legend update
                 drv.execute_script("""
                     let canvas = document.querySelector('canvas');
                     if (canvas) {
                         let rect = canvas.getBoundingClientRect();
                         let evt = new MouseEvent('mousemove', {
-                            clientX: rect.left + 200,
-                            clientY: rect.top + 200,
+                            clientX: rect.left + 300,
+                            clientY: rect.top + 150,
                             bubbles: true
                         });
                         canvas.dispatchEvent(evt);
