@@ -357,7 +357,7 @@ def scrape_day(url, label=""):
             drv.get(url)
 
             # Extra buffer time for TradingView indicators to calculate in headless Chrome
-            time.sleep(3)
+            time.sleep(15)
 
             try:
                 WebDriverWait(
