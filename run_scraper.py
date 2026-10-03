@@ -109,22 +109,28 @@ def restart_driver():
 
 # ---------------- SCRAPER ---------------- #
 def get_values(drv):
-    try:
-        # Check both class containing valueValue and dynamic legend indicators
-        selectors = [
-            "[class*='valueValue']",
-            "[class*='item-'][class*='value-']",
-            "div[data-name='legend-source-title'] + div",
-            "[class*='legend-'] [class*='value-']"
-        ]
-        vals = []
-        for selector in selectors:
+    """Scrapes values using multiple target class selectors used by TradingView legends."""
+    selectors = [
+        "[class*='valueValue']",
+        "[class*='legendSingleValue']",
+        "[class*='valuesWrapper'] > span",
+        "[class*='value-'][class*='item-']",
+        "div[data-name='legend-source-title'] ~ div span"
+    ]
+    
+    for selector in selectors:
+        try:
             elements = drv.find_elements(By.CSS_SELECTOR, selector)
-            extracted = [el.text.strip() for el in elements if el.text.strip()]
-            if len(extracted) > len(vals):
-                vals = extracted
+            vals = [el.text.strip() for el in elements if el.text.strip()]
             if len(vals) >= EXPECTED_COUNT:
-                break
+                return vals
+        except:
+            continue
+            
+    # Fallback sweep: collect text from all dynamic value elements
+    try:
+        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='value']")
+        vals = [el.text.strip() for el in elements if el.text.strip() and el.text.strip() != "Ø"]
         return vals
     except:
         return []
@@ -137,36 +143,47 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # Wait for chart body DOM to settle
-            WebDriverWait(drv, 15).until(
+            # Step 1: Wait for main page DOM body to load
+            WebDriverWait(drv, 45).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
-            time.sleep(4)  # Allow TradingView WebGL/Canvas layout engines to draw
             
-            # Smart polling loop for value items
+            # Step 2: Extended wait for TradingView layout and WebGL/Chart engine initialization
+            time.sleep(8)
+            
+            # Step 3: Ensure legend panel is expanded (clicks toggle arrow if collapsed)
+            drv.execute_script("""
+                let toggleBtn = document.querySelector('[class*="toggleButton"]');
+                if (toggleBtn && toggleBtn.getAttribute('aria-expanded') === 'false') {
+                    toggleBtn.click();
+                }
+            """)
+            time.sleep(2)
+
+            # Step 4: Active Polling loop for full page indicator data load (up to 30s)
             vals = []
-            max_poll_seconds = 15
+            max_poll_time = 30
             start_poll = time.time()
             
-            while time.time() - start_poll < max_poll_seconds:
+            while time.time() - start_poll < max_poll_time:
                 vals = get_values(drv)
                 if len(vals) >= EXPECTED_COUNT:
                     break
                 
-                # Perform subtle mouse hover over chart canvas to trigger legend value visibility
+                # Trigger hover on canvas to activate dynamic legend tooltips/values
                 drv.execute_script("""
-                    var canvas = document.querySelector('canvas');
-                    if(canvas) {
-                        var event = new MouseEvent('mousemove', {
-                            clientX: canvas.getBoundingClientRect().left + 100,
-                            clientY: canvas.getBoundingClientRect().top + 100,
+                    let canvas = document.querySelector('canvas');
+                    if (canvas) {
+                        let rect = canvas.getBoundingClientRect();
+                        let evt = new MouseEvent('mousemove', {
+                            clientX: rect.left + 200,
+                            clientY: rect.top + 200,
                             bubbles: true
                         });
-                        canvas.dispatchEvent(event);
+                        canvas.dispatchEvent(evt);
                     }
-                    window.scrollBy(0, 200);
                 """)
-                time.sleep(1.5)
+                time.sleep(2.0)
             
             browser_url = drv.current_url
             found_count = len(vals)
