@@ -57,23 +57,30 @@ MAX_DEBUG_SAVES = int(os.getenv("MAX_DEBUG_SAVES", "5"))
 CLEAN_NUMBERS = os.getenv("CLEAN_NUMBERS", "0") == "1"
 
 
-# JavaScript that runs inside the chart page:
+# JavaScript that runs inside the chart page using textContent for Headless Chrome
 GET_VALUES_JS = """
 const want = arguments[0];
-const titles = [...document.querySelectorAll('[class*="title-"]')]
-  .filter(e => (e.innerText || '').trim() === want);
+const titles = [...document.querySelectorAll('[class*="title-"], [class*="legend-"]')]
+  .filter(e => (e.textContent || '').trim().includes(want));
+
 if (!titles.length) {
   return {found: false, values: []};
 }
+
 let node = titles[0];
-while (node && node.querySelectorAll('[class*="valueValue-"]').length === 0) {
+while (node && node.querySelectorAll('[class*="valueValue-"], [class*="value-"]').length === 0) {
   node = node.parentElement;
 }
+
 if (!node) {
   return {found: true, values: []};
 }
-const values = [...node.querySelectorAll('[class*="valueValue-"]')]
-  .map(e => (e.innerText || '').trim());
+
+const valueElements = [...node.querySelectorAll('[class*="valueValue-"], [class*="value-"]')];
+const values = valueElements
+  .map(e => (e.textContent || '').trim())
+  .filter(v => v.length > 0);
+
 return {found: true, values: values};
 """
 
@@ -275,7 +282,7 @@ def create_driver():
                 f"{describe_error(e)}"
             )
     else:
-        log(f"   ⚠️️ No cookie file found at {COOKIE_FILE}")
+        log(f"   ⚠️ No cookie file found at {COOKIE_FILE}")
 
     return drv
 
@@ -314,7 +321,7 @@ def get_values(drv):
 
         vals = [
             v for v in result.get("values", [])
-            if v
+            if v and v != "∅"
         ]
 
         return vals, bool(result.get("found"))
@@ -348,6 +355,9 @@ def scrape_day(url, label=""):
             )
 
             drv.get(url)
+
+            # Extra buffer time for TradingView indicators to calculate in headless Chrome
+            time.sleep(3)
 
             try:
                 WebDriverWait(
@@ -476,7 +486,6 @@ def process_row(
 
     row_idx = i + 1
 
-    # Explicitly prepend sheet title so gspread updates the exact tab
     row_payload = [
         {
             "range": f"'{sheet_title}'!A{row_idx}",
