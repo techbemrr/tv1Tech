@@ -53,7 +53,7 @@ def api_retry(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             wait = (2 ** attempt) + random.random()
-            log(f"⚠️️ API Issue: {str(e)[:50]}. Retrying in {wait:.1f}s...")
+            log(f"⚠ API Issue: {str(e)[:50]}. Retrying in {wait:.1f}s...")
             time.sleep(wait)
     return func(*args, **kwargs)
 
@@ -72,10 +72,15 @@ driver = None
 def create_driver():
     log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
-    opts.add_argument("--headless=new")
+    
+    # --- VISIBILITY CHANGES START HERE ---
+    # Disabled headless mode and added window maximization to view visually
+    # opts.add_argument("--headless=new") 
+    opts.add_argument("--start-maximized")
+    # --- VISIBILITY CHANGES END HERE ---
+
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
