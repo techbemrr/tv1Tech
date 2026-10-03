@@ -3,14 +3,14 @@ import os
 import time
 import json
 import random
+import traceback
 from datetime import date
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 import gspread
 from webdriver_manager.chrome import ChromeDriverManager
@@ -44,8 +44,58 @@ CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 DAY_OUTPUT_START_COL = 3
 
-# NEW TradingView value class
-VALUE_SELECTOR = ".valueValue-quatTGAC"
+# CHANGED: no longer depends on the auto-generated "-quatTGAC" suffix.
+# The values are found by the indicator's title as shown in the chart legend.
+# If you rename the indicator in your TradingView layout, change this
+# (or set the INDICATOR_TITLE env variable in the workflow).
+INDICATOR_TITLE = os.getenv("INDICATOR_TITLE", "DAY")
+
+# How long to wait for all 18 values to render (seconds)
+VALUES_TIMEOUT = int(os.getenv("VALUES_TIMEOUT", "30"))
+
+# Max time for a page load before giving up (seconds)
+PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "45"))
+
+# NEW: stop the run early if this many symbols in a row fail,
+# instead of running for hours and writing empty rows.
+# Set to 0 to disable.
+MAX_CONSECUTIVE_FAILS = int(os.getenv("MAX_CONSECUTIVE_FAILS", "5"))
+
+# NEW: on failure, save a screenshot + page HTML here (upload it as an
+# artifact in the workflow to see what the browser actually loaded).
+DEBUG_DIR = os.getenv("DEBUG_DIR", "debug")
+MAX_DEBUG_SAVES = int(os.getenv("MAX_DEBUG_SAVES", "5"))
+
+# OPTIONAL: convert TradingView's "−" (Unicode minus) to "-" and remove
+# thousands commas ("1,176" -> "1176"). Off by default so the values written
+# to the sheet stay exactly as before. Set CLEAN_NUMBERS=1 to turn on.
+CLEAN_NUMBERS = os.getenv("CLEAN_NUMBERS", "0") == "1"
+
+
+# JavaScript that runs inside the chart page:
+# 1. finds the legend title equal to INDICATOR_TITLE (e.g. "DAY")
+# 2. walks up to the nearest box that also contains values
+# 3. returns those values in order
+# Matching on the "valueValue-" prefix survives TradingView changing the
+# random suffix (e.g. "-quatTGAC") in a future site update.
+GET_VALUES_JS = """
+const want = arguments[0];
+const titles = [...document.querySelectorAll('[class*="title-"]')]
+  .filter(e => (e.innerText || '').trim() === want);
+if (!titles.length) {
+  return {found: false, values: []};
+}
+let node = titles[0];
+while (node && node.querySelectorAll('[class*="valueValue-"]').length === 0) {
+  node = node.parentElement;
+}
+if (!node) {
+  return {found: true, values: []};
+}
+const values = [...node.querySelectorAll('[class*="valueValue-"]')]
+  .map(e => (e.innerText || '').trim());
+return {found: true, values: values};
+"""
 
 
 # ---------------- COLUMN UTILS ---------------- #
@@ -122,6 +172,50 @@ else:
     last_i = START_ROW
 
 
+# ---------------- ERROR / DEBUG HELPERS ---------------- #
+
+def describe_error(e):
+    # CHANGED: Selenium's TimeoutException has an empty message, which is why
+    # the log only showed "Failed: Message:". Always include the error type.
+    msg = str(e).strip().replace("\n", " ")
+    return f"{type(e).__name__}: {msg[:150] if msg else '(no message)'}"
+
+
+_debug_saves = 0
+
+
+def save_debug(drv, label):
+    # NEW: save what the browser actually saw, so a block page, login page
+    # or changed layout is visible in the workflow artifacts.
+    global _debug_saves
+
+    if drv is None or _debug_saves >= MAX_DEBUG_SAVES:
+        return
+
+    _debug_saves += 1
+
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        safe = "".join(ch if ch.isalnum() else "_" for ch in label)[:60]
+        base = os.path.join(DEBUG_DIR, f"{_debug_saves:02d}_{safe}")
+
+        try:
+            log(f"   🧾 Page title: {drv.title!r}")
+            log(f"   🧾 Current URL: {drv.current_url}")
+        except Exception:
+            pass
+
+        drv.save_screenshot(base + ".png")
+
+        with open(base + ".html", "w", encoding="utf-8") as f:
+            f.write(drv.page_source)
+
+        log(f"   🧾 Saved debug files: {base}.png / .html")
+
+    except Exception as e:
+        log(f"   ⚠️ Could not save debug files: {describe_error(e)}")
+
+
 # ---------------- DRIVER ---------------- #
 
 driver = None
@@ -144,19 +238,30 @@ def create_driver():
         "--disable-blink-features=AutomationControlled"
     )
 
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/120.0.0.0 "
-        "Safari/537.36"
-    )
+    # CHANGED: removed the hard-coded "Chrome/120.0.0.0" user agent.
+    # Chrome 120 is years older than the Chrome that GitHub installs, and a
+    # site can treat an outdated browser differently. The real version is
+    # used below instead.
 
     drv = webdriver.Chrome(
         service=Service(CHROME_DRIVER_PATH),
         options=opts
     )
+
+    drv.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+
+    # Use the real browser version, minus the "HeadlessChrome" marker,
+    # so the user agent matches the browser actually running.
+    try:
+        ua = drv.execute_script("return navigator.userAgent")
+        ua = ua.replace("HeadlessChrome", "Chrome")
+        drv.execute_cdp_cmd(
+            "Network.setUserAgentOverride",
+            {"userAgent": ua}
+        )
+        log(f"   🧭 Browser: {ua}")
+    except Exception as e:
+        log(f"   ⚠️ Could not set user agent: {describe_error(e)}")
 
     # ---------------- LOAD COOKIES ---------------- #
 
@@ -174,6 +279,11 @@ def create_driver():
 
                 cookies = json.load(f)
 
+            added = 0
+            expired = 0
+            failed = 0
+            now = time.time()
+
             for c in cookies:
 
                 cookie = {
@@ -188,10 +298,37 @@ def create_driver():
                     )
                 }
 
+                # NEW: count expired cookies (an expired login is a common
+                # reason for values to suddenly disappear)
+                exp = c.get("expiry") or c.get("expirationDate")
+                if exp and float(exp) < now:
+                    expired += 1
+
+                # Selenium expects an integer expiry
+                if "expiry" in cookie:
+                    try:
+                        cookie["expiry"] = int(cookie["expiry"])
+                    except Exception:
+                        cookie.pop("expiry", None)
+
                 try:
                     drv.add_cookie(cookie)
+                    added += 1
                 except Exception:
-                    pass
+                    failed += 1
+
+            # CHANGED: report cookie loading instead of failing silently
+            log(
+                f"   🍪 Cookies: {added} added, "
+                f"{failed} failed, {expired} already expired "
+                f"(site: {drv.current_url})"
+            )
+
+            if expired:
+                log(
+                    "   ⚠️ Some cookies are expired. "
+                    "Refresh the cookies secret if values are missing."
+                )
 
             drv.refresh()
 
@@ -201,8 +338,12 @@ def create_driver():
 
             log(
                 f"⚠️ Cookie loading failed: "
-                f"{str(e)[:100]}"
+                f"{describe_error(e)}"
             )
+
+    else:
+
+        log(f"   ⚠️ No cookie file found at {COOKIE_FILE}")
 
     return drv
 
@@ -234,34 +375,44 @@ def restart_driver():
 
 # ---------------- SCRAPER ---------------- #
 
+def clean_value(v):
+
+    if not CLEAN_NUMBERS:
+        return v
+
+    return v.replace("−", "-").replace(",", "")
+
+
 def get_values(drv):
+    # CHANGED: reads only the values of the INDICATOR_TITLE indicator,
+    # not every value in the legend (the old selector could also pick up
+    # the stock's own O/H/L/C/Vol values).
 
     try:
 
-        elements = drv.find_elements(
-            By.CSS_SELECTOR,
-            VALUE_SELECTOR
-        )
+        result = drv.execute_script(
+            GET_VALUES_JS,
+            INDICATOR_TITLE
+        ) or {}
 
         vals = [
-            el.text.strip()
-            for el in elements
-            if el.text.strip()
+            v for v in result.get("values", [])
+            if v
         ]
 
-        return vals
+        return vals, bool(result.get("found"))
 
     except Exception as e:
 
         log(
             f"⚠️ Could not read values: "
-            f"{str(e)[:100]}"
+            f"{describe_error(e)}"
         )
 
-        return []
+        return [], False
 
 
-def scrape_day(url):
+def scrape_day(url, label=""):
 
     if not url:
 
@@ -274,6 +425,8 @@ def scrape_day(url):
 
     for attempt in range(2):
 
+        drv = None
+
         try:
 
             drv = ensure_driver()
@@ -285,49 +438,24 @@ def scrape_day(url):
 
             drv.get(url)
 
-            # Wait for the NEW class
-            WebDriverWait(
-                drv,
-                20
-            ).until(
-                EC.presence_of_element_located(
-                    (
-                        By.CSS_SELECTOR,
-                        VALUE_SELECTOR
-                    )
+            # CHANGED: wait until all 18 indicator values have rendered,
+            # instead of waiting for one element and then sleeping/scrolling.
+            # (The chart doesn't scroll, so the scroll loop was removed.)
+            try:
+
+                WebDriverWait(
+                    drv,
+                    VALUES_TIMEOUT,
+                    poll_frequency=1
+                ).until(
+                    lambda d: len(get_values(d)[0]) >= EXPECTED_COUNT
                 )
-            )
 
-            # Allow page to finish rendering
-            time.sleep(3)
+            except TimeoutException:
 
-            vals = get_values(drv)
+                pass  # handled below with a clear message
 
-            # ---------------- SCROLL CHECK ---------------- #
-
-            if len(vals) < EXPECTED_COUNT:
-
-                for scroll_y in [
-                    600,
-                    1200,
-                    2000
-                ]:
-
-                    drv.execute_script(
-                        f"window.scrollTo(0, {scroll_y});"
-                    )
-
-                    time.sleep(1.5)
-
-                    new_vals = get_values(drv)
-
-                    if len(new_vals) > len(vals):
-
-                        vals = new_vals
-
-                    if len(vals) >= EXPECTED_COUNT:
-
-                        break
+            vals, title_found = get_values(drv)
 
             browser_url = drv.current_url
 
@@ -343,40 +471,68 @@ def scrape_day(url):
                 )
 
                 return (
-                    vals[:EXPECTED_COUNT],
+                    [clean_value(v) for v in vals[:EXPECTED_COUNT]],
                     "OK",
                     url,
                     browser_url
                 )
 
+            # NEW: say *why* it failed
+            if not title_found:
+                reason = (
+                    f"indicator title '{INDICATOR_TITLE}' not on page "
+                    f"(wrong page, logged out, blocked, or not loaded)"
+                )
             else:
-
-                log(
-                    f"   ⚠️ Found "
-                    f"{found_count}/{EXPECTED_COUNT} "
-                    f"(Marking NOT OK)"
+                reason = (
+                    f"indicator found but only "
+                    f"{found_count}/{EXPECTED_COUNT} values"
                 )
 
-                padded = (
-                    vals +
-                    [""] * EXPECTED_COUNT
-                )[:EXPECTED_COUNT]
+            log(
+                f"   ⚠️ Attempt {attempt + 1}: {reason}"
+            )
 
-                return (
-                    padded,
-                    "NOT OK",
-                    url,
-                    browser_url
-                )
+            save_debug(drv, f"{label}_attempt{attempt + 1}")
+
+            if attempt == 0:
+                # page may just have been slow; try once more
+                # with the same browser
+                continue
+
+            padded = (
+                [clean_value(v) for v in vals] +
+                [""] * EXPECTED_COUNT
+            )[:EXPECTED_COUNT]
+
+            log(
+                f"   ⚠️ Found "
+                f"{found_count}/{EXPECTED_COUNT} "
+                f"(Marking NOT OK)"
+            )
+
+            return (
+                padded,
+                "NOT OK",
+                url,
+                browser_url
+            )
 
         except Exception as e:
 
+            # CHANGED: log the error type + full traceback, not just
+            # the (often empty) message
             log(
                 f"   ❌ Attempt "
                 f"{attempt + 1} Failed: "
-                f"{str(e)[:100]}"
+                f"{describe_error(e)}"
             )
 
+            log(traceback.format_exc().strip()[-800:])
+
+            save_debug(drv, f"{label}_error{attempt + 1}")
+
+            # Only a browser crash needs a fresh browser
             restart_driver()
 
     return (
@@ -433,7 +589,10 @@ def process_row(
         f"URL: {url if url else 'No URL'}"
     )
 
-    vals, status, sheet_url_used, browser_url_used = scrape_day(url)
+    vals, status, sheet_url_used, browser_url_used = scrape_day(
+        url,
+        label=f"{i + 1}_{name}"
+    )
 
     row_idx = i + 1
 
@@ -474,7 +633,8 @@ def process_row(
 
     ]
 
-    return row_payload, (status == "OK")
+    # A row with no URL is not a scraping failure
+    return row_payload, (status == "OK"), bool(url)
 
 
 # ---------------- CONNECT ---------------- #
@@ -523,6 +683,10 @@ loop_end = min(
     len(company_list)
 )
 
+consecutive_fails = 0
+streak_start = None
+aborted = False
+
 
 # ---------------- FIRST PASS ---------------- #
 
@@ -531,7 +695,7 @@ for i in range(
     loop_end
 ):
 
-    payload, success = process_row(
+    payload, success, had_url = process_row(
         i,
         company_list,
         url_list,
@@ -544,6 +708,15 @@ for i in range(
 
         retry_indices.append(i)
 
+    # NEW: track failures in a row (rows without a URL don't count)
+    if had_url and not success:
+        if consecutive_fails == 0:
+            streak_start = i
+        consecutive_fails += 1
+    elif success:
+        consecutive_fails = 0
+        streak_start = None
+
     # Save checkpoint
 
     with open(
@@ -552,6 +725,25 @@ for i in range(
     ) as f:
 
         f.write(str(i + 1))
+
+    if (
+        MAX_CONSECUTIVE_FAILS
+        and consecutive_fails >= MAX_CONSECUTIVE_FAILS
+    ):
+
+        log(
+            f"🛑 {consecutive_fails} symbols in a row failed. "
+            f"Stopping early - check the debug screenshots "
+            f"in the workflow artifacts."
+        )
+
+        # Point the checkpoint back at the first failed row so a rerun
+        # doesn't skip these symbols
+        with open(checkpoint_file, "w") as f:
+            f.write(str(streak_start))
+
+        aborted = True
+        break
 
     # Restart browser periodically
 
@@ -589,6 +781,16 @@ if batch_list:
     batch_list = []
 
 
+if aborted:
+
+    restart_driver()
+
+    log("❌ SCRAPING ABORTED (too many failures in a row).")
+
+    # Non-zero exit so the GitHub run shows as failed
+    sys.exit(1)
+
+
 # ---------------- RETRY PASS ---------------- #
 
 if retry_indices:
@@ -607,7 +809,7 @@ if retry_indices:
         retry_indices
     ):
 
-        payload, success = process_row(
+        payload, success, _ = process_row(
             i,
             company_list,
             url_list,
