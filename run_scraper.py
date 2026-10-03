@@ -3,7 +3,6 @@ import os
 import time
 import json
 import random
-import re
 from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -54,7 +53,7 @@ def api_retry(func, *args, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             wait = (2 ** attempt) + random.random()
-            log(f"⚠️ API Issue: {str(e)[:50]}. Retrying in {wait:.1f}s...")
+            log(f"⚠️️ API Issue: {str(e)[:50]}. Retrying in {wait:.1f}s...")
             time.sleep(wait)
     return func(*args, **kwargs)
 
@@ -109,42 +108,11 @@ def restart_driver():
     driver = None
 
 # ---------------- SCRAPER ---------------- #
-def extract_legend_values_via_js(drv):
-    """JS script to grab text from all legend items directly from the DOM tree."""
-    js_script = """
-    let results = [];
-    
-    // 1. Try finding legend values container
-    let legendContainers = document.querySelectorAll('[class*="legend-"], [class*="legendMainSource"]');
-    
-    legendContainers.forEach(container => {
-        let spans = container.querySelectorAll('span, div');
-        spans.forEach(el => {
-            let txt = el.innerText ? el.innerText.trim() : '';
-            if (txt && !results.includes(txt)) {
-                // Match numerical values or indicators
-                if (/^-?\\d+(\\.\\d+)?$/.test(txt) || txt === 'Ø') {
-                    results.push(txt);
-                }
-            }
-        });
-    });
-    
-    // 2. Fallback: Scan top-left legend overlay directly
-    if (results.length < 18) {
-        let allValues = document.querySelectorAll('[class*="value-"], [class*="valueValue"]');
-        allValues.forEach(el => {
-            let txt = el.innerText ? el.innerText.trim() : '';
-            if (txt) {
-                results.push(txt);
-            }
-        });
-    }
-    
-    return results;
-    """
+def get_values(drv):
     try:
-        return drv.execute_script(js_script)
+        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")
+        vals = [el.text.strip() for el in elements if el.text.strip()]
+        return vals
     except:
         return []
 
@@ -156,39 +124,37 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # 1. Wait for canvas or body to ensure the chart is ready
-            WebDriverWait(drv, 40).until(
-                EC.presence_of_element_located((By.TAG_NAME, "canvas"))
+            # 1. Wait for page body load
+            WebDriverWait(drv, 45).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
-            # 2. Allow TradingView layout engine & WebSocket data stream to finish loading
-            time.sleep(10)
+            # 2. Allow chart canvas and WebSocket data connection to complete loading
+            time.sleep(8)
             
-            # 3. Trigger legend expansion if collapsed
-            drv.execute_script("""
-                let arrow = document.querySelector('[class*="toggleButton"], [class*="pane-legend-icon"]');
-                if (arrow) arrow.click();
-            """)
-            time.sleep(2)
+            # 3. Wait until at least one [class*='valueValue'] element is populated with non-empty text
+            WebDriverWait(drv, 40).until(
+                lambda d: len([el for el in d.find_elements(By.CSS_SELECTOR, "[class*='valueValue']") if el.text.strip()]) > 0
+            )
 
-            # 4. Polling for complete legend values
+            # 4. Polling loop until all expected values populate
             vals = []
+            max_poll_seconds = 30
             start_poll = time.time()
-            max_poll = 25
             
-            while time.time() - start_poll < max_poll:
-                vals = extract_legend_values_via_js(drv)
+            while time.time() - start_poll < max_poll_seconds:
+                vals = get_values(drv)
                 if len(vals) >= EXPECTED_COUNT:
                     break
                 
-                # Dispatch mouse movement over canvas to activate dynamic legend update
+                # Hover over canvas to activate legend text rendering if idle
                 drv.execute_script("""
                     let canvas = document.querySelector('canvas');
                     if (canvas) {
                         let rect = canvas.getBoundingClientRect();
                         let evt = new MouseEvent('mousemove', {
-                            clientX: rect.left + 300,
-                            clientY: rect.top + 150,
+                            clientX: rect.left + 200,
+                            clientY: rect.top + 200,
                             bubbles: true
                         });
                         canvas.dispatchEvent(evt);
