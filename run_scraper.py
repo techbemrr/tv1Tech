@@ -125,7 +125,7 @@ def scrape_day(url):
             drv.get(url)
             WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
             
-            time.sleep(15) # Initial render wait
+            time.sleep(60) # Initial render wait
             vals = get_values(drv)
 
             if len(vals) < EXPECTED_COUNT:
