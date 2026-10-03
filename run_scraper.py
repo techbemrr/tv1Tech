@@ -123,23 +123,32 @@ def scrape_day(url):
         try:
             drv = ensure_driver()
             drv.get(url)
-            WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
             
-            time.sleep(3) # Initial render wait
-            vals = get_values(drv)
-
-            if len(vals) < EXPECTED_COUNT:
-                for scroll_y in [600, 1200, 2000]:
-                    drv.execute_script(f"window.scrollTo(0, {scroll_y});")
-                    time.sleep(1.5)
-                    new_vals = get_values(drv)
-                    if len(new_vals) > len(vals): vals = new_vals
-                    if len(vals) >= EXPECTED_COUNT: break
-
+            # Wait until at least one value component is populated with actual text
+            WebDriverWait(drv, 25).until(
+                lambda d: len([el for el in d.find_elements(By.CSS_SELECTOR, "[class*='valueValue']") if el.text.strip()]) > 0
+            )
+            
+            # Active polling loop for dynamic JS rendering
+            vals = []
+            max_poll_time = 15  # Max additional polling time in seconds
+            start_poll = time.time()
+            
+            while time.time() - start_poll < max_poll_time:
+                vals = get_values(drv)
+                if len(vals) >= EXPECTED_COUNT:
+                    break
+                
+                # Scroll sweeps across the window and internal containers
+                drv.execute_script("""
+                    window.scrollBy(0, 400);
+                    document.querySelectorAll('div[class*="scroll"]').forEach(el => el.scrollTop += 400);
+                """)
+                time.sleep(1.0)
+            
             browser_url = drv.current_url
             found_count = len(vals)
             
-            # Logic: Strictly OK or NOT OK
             if found_count >= EXPECTED_COUNT:
                 log(f"   ✅ Found {found_count}/{EXPECTED_COUNT}")
                 return vals[:EXPECTED_COUNT], "OK", url, browser_url
@@ -148,8 +157,8 @@ def scrape_day(url):
                 padded = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
                 return padded, "NOT OK", url, browser_url
                 
-        except Exception:
-            log(f"   ❌ Attempt {attempt + 1} Failed")
+        except Exception as e:
+            log(f"   ❌ Attempt {attempt + 1} Failed: {str(e)[:60]}")
             restart_driver()
             
     return [""] * EXPECTED_COUNT, "NOT OK", url, ""
