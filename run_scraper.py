@@ -110,8 +110,21 @@ def restart_driver():
 # ---------------- SCRAPER ---------------- #
 def get_values(drv):
     try:
-        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")
-        vals = [el.text.strip() for el in elements if el.text.strip()]
+        # Check both class containing valueValue and dynamic legend indicators
+        selectors = [
+            "[class*='valueValue']",
+            "[class*='item-'][class*='value-']",
+            "div[data-name='legend-source-title'] + div",
+            "[class*='legend-'] [class*='value-']"
+        ]
+        vals = []
+        for selector in selectors:
+            elements = drv.find_elements(By.CSS_SELECTOR, selector)
+            extracted = [el.text.strip() for el in elements if el.text.strip()]
+            if len(extracted) > len(vals):
+                vals = extracted
+            if len(vals) >= EXPECTED_COUNT:
+                break
         return vals
     except:
         return []
@@ -124,27 +137,36 @@ def scrape_day(url):
             drv = ensure_driver()
             drv.get(url)
             
-            # Wait until at least one value component is populated with actual text
-            WebDriverWait(drv, 25).until(
-                lambda d: len([el for el in d.find_elements(By.CSS_SELECTOR, "[class*='valueValue']") if el.text.strip()]) > 0
+            # Wait for chart body DOM to settle
+            WebDriverWait(drv, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
+            time.sleep(4)  # Allow TradingView WebGL/Canvas layout engines to draw
             
-            # Active polling loop for dynamic JS rendering
+            # Smart polling loop for value items
             vals = []
-            max_poll_time = 15  # Max additional polling time in seconds
+            max_poll_seconds = 15
             start_poll = time.time()
             
-            while time.time() - start_poll < max_poll_time:
+            while time.time() - start_poll < max_poll_seconds:
                 vals = get_values(drv)
                 if len(vals) >= EXPECTED_COUNT:
                     break
                 
-                # Scroll sweeps across the window and internal containers
+                # Perform subtle mouse hover over chart canvas to trigger legend value visibility
                 drv.execute_script("""
-                    window.scrollBy(0, 400);
-                    document.querySelectorAll('div[class*="scroll"]').forEach(el => el.scrollTop += 400);
+                    var canvas = document.querySelector('canvas');
+                    if(canvas) {
+                        var event = new MouseEvent('mousemove', {
+                            clientX: canvas.getBoundingClientRect().left + 100,
+                            clientY: canvas.getBoundingClientRect().top + 100,
+                            bubbles: true
+                        });
+                        canvas.dispatchEvent(event);
+                    }
+                    window.scrollBy(0, 200);
                 """)
-                time.sleep(1.0)
+                time.sleep(1.5)
             
             browser_url = drv.current_url
             found_count = len(vals)
