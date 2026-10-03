@@ -33,6 +33,6 @@ jobs:
       - name: Run scraper
         env:
           SHARD_INDEX: ${{ matrix.shard_index }}
-          SHARD_SIZE: 102
+          SHARD_SIZE: 5
           CHECKPOINT_FILE: checkpoint_${{ matrix.shard_index }}.txt
         run: python run_scraper.py
