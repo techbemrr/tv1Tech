@@ -5,375 +5,1967 @@ import json
 import random
 import traceback
 from datetime import date
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
+
 import gspread
 from webdriver_manager.chrome import ChromeDriverManager
+
+
+# ============================================================
+# LOG
+# ============================================================
 
 def log(msg):
     t = time.strftime("%H:%M:%S")
     print(f"[{t}] {msg}", flush=True)
 
-# ---------------- CONFIG ---------------- #
+
+# ============================================================
+# CONFIG
+# ============================================================
+
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
+
 START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
-checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_week_{SHARD_INDEX}.txt")
+
+CHECKPOINT_FILE = os.getenv(
+    "CHECKPOINT_FILE",
+    f"checkpoint_week_{SHARD_INDEX}.txt"
+)
 
 EXPECTED_COUNT = 24
+
 BATCH_SIZE = 100
+
 RESTART_EVERY_ROWS = 20
-COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
+
+COOKIE_FILE = os.getenv(
+    "COOKIE_FILE",
+    "cookies.json"
+)
+
 CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-WEEK_OUTPUT_START_COL = 3
+WEEK_OUTPUT_START_COL = 3  # C
 
-# NEW: optional. If set to the indicator's title as shown in the chart legend
-# (like "DAY" in the daily chart), only that indicator's values are read.
-# If left empty, values are read exactly as before (every visible value on
-# the page, in order), so the columns written to the sheet don't change.
-INDICATOR_TITLE = os.getenv("INDICATOR_TITLE", "").strip()
 
-# How long to wait for all values to render (seconds)
-VALUES_TIMEOUT = int(os.getenv("VALUES_TIMEOUT", "30"))
-PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "60"))
+# ============================================================
+# OPTIONAL INDICATOR
+# ============================================================
 
-# NEW: stop early if this many symbols in a row fail (0 = never stop early)
-MAX_CONSECUTIVE_FAILS = int(os.getenv("MAX_CONSECUTIVE_FAILS", "5"))
+INDICATOR_TITLE = os.getenv(
+    "INDICATOR_TITLE",
+    ""
+).strip()
 
-# NEW: screenshots + page HTML of failures (upload as a workflow artifact)
-DEBUG_DIR = os.getenv("DEBUG_DIR", "debug_week")
-MAX_DEBUG_SAVES = int(os.getenv("MAX_DEBUG_SAVES", "5"))
 
-# OPTIONAL: "−" -> "-" and "1,176" -> "1176". Off by default (values unchanged).
-CLEAN_NUMBERS = os.getenv("CLEAN_NUMBERS", "0") == "1"
+# ============================================================
+# TIMEOUTS
+# ============================================================
 
-# Used only when INDICATOR_TITLE is set. Matches on the "valueValue-" prefix,
-# so TradingView changing the random suffix (e.g. "-quatTGAC") doesn't matter.
-GET_VALUES_JS = """
-const want = arguments[0];
-const titles = [...document.querySelectorAll('[class*="title-"]')]
-  .filter(e => (e.innerText || '').trim() === want);
-if (!titles.length) {
-  return {found: false, values: []};
-}
-let node = titles[0];
-while (node && node.querySelectorAll('[class*="valueValue-"]').length === 0) {
-  node = node.parentElement;
-}
-if (!node) {
-  return {found: true, values: []};
-}
-const values = [...node.querySelectorAll('[class*="valueValue-"]')]
-  .map(e => (e.innerText || '').trim());
-return {found: true, values: values};
-"""
+VALUES_TIMEOUT = int(
+    os.getenv(
+        "VALUES_TIMEOUT",
+        "40"
+    )
+)
 
-# ---------------- UTILS ---------------- #
+PAGE_LOAD_TIMEOUT = int(
+    os.getenv(
+        "PAGE_LOAD_TIMEOUT",
+        "60"
+    )
+)
+
+
+# ============================================================
+# FAILURE CONTROL
+# ============================================================
+
+MAX_CONSECUTIVE_FAILS = int(
+    os.getenv(
+        "MAX_CONSECUTIVE_FAILS",
+        "5"
+    )
+)
+
+
+# ============================================================
+# DEBUG
+# ============================================================
+
+DEBUG_DIR = os.getenv(
+    "DEBUG_DIR",
+    "debug_week"
+)
+
+MAX_DEBUG_SAVES = int(
+    os.getenv(
+        "MAX_DEBUG_SAVES",
+        "5"
+    )
+)
+
+
+# ============================================================
+# NUMBER CLEANING
+# ============================================================
+
+CLEAN_NUMBERS = (
+    os.getenv(
+        "CLEAN_NUMBERS",
+        "0"
+    ) == "1"
+)
+
+
+# ============================================================
+# COLUMNS
+# ============================================================
+
 def col_num_to_letter(n):
+
     result = ""
+
     while n > 0:
-        n, rem = divmod(n - 1, 26)
-        result = chr(65 + rem) + result
+
+        n, rem = divmod(
+            n - 1,
+            26
+        )
+
+        result = (
+            chr(65 + rem)
+            + result
+        )
+
     return result
 
-WEEK_START_COL_LETTER = col_num_to_letter(WEEK_OUTPUT_START_COL)
-WEEK_END_COL_LETTER = col_num_to_letter(WEEK_OUTPUT_START_COL + EXPECTED_COUNT - 1)
 
-def api_retry(func, *args, **kwargs):
+WEEK_START_COL_LETTER = (
+    col_num_to_letter(
+        WEEK_OUTPUT_START_COL
+    )
+)
+
+WEEK_END_COL_LETTER = (
+    col_num_to_letter(
+        WEEK_OUTPUT_START_COL
+        + EXPECTED_COUNT
+        - 1
+    )
+)
+
+
+log(
+    f"📌 WEEK output columns: "
+    f"{WEEK_START_COL_LETTER}:"
+    f"{WEEK_END_COL_LETTER}"
+)
+
+log(
+    f"📌 Expected values: "
+    f"{EXPECTED_COUNT}"
+)
+
+
+# ============================================================
+# JAVASCRIPT INDICATOR EXTRACTION
+# ============================================================
+
+GET_INDICATOR_VALUES_JS = """
+const wantedTitle = arguments[0];
+
+const titles = [
+    ...document.querySelectorAll('[class*="title-"]')
+].filter(
+    e => (e.innerText || '').trim() === wantedTitle
+);
+
+if (!titles.length) {
+    return {
+        found: false,
+        values: []
+    };
+}
+
+let node = titles[0];
+
+while (
+    node &&
+    node.querySelectorAll(
+        '[class*="valueValue-"]'
+    ).length === 0
+) {
+    node = node.parentElement;
+}
+
+if (!node) {
+    return {
+        found: true,
+        values: []
+    };
+}
+
+const elements = [
+    ...node.querySelectorAll(
+        '[class*="valueValue-"]'
+    )
+];
+
+const values = [];
+
+for (const e of elements) {
+
+    const text = (
+        e.innerText || ''
+    ).trim();
+
+    if (!text) {
+        continue;
+    }
+
+    const lines = text
+        .split(/\\n+/)
+        .map(x => x.trim())
+        .filter(Boolean);
+
+    for (const line of lines) {
+        values.push(line);
+    }
+}
+
+return {
+    found: true,
+    values: values
+};
+"""
+
+
+# ============================================================
+# API RETRY
+# ============================================================
+
+def api_retry(
+    func,
+    *args,
+    **kwargs
+):
+
     for attempt in range(5):
+
         try:
-            return func(*args, **kwargs)
+
+            return func(
+                *args,
+                **kwargs
+            )
+
         except Exception as e:
-            wait = (2 ** attempt) + random.random()
-            log(f"⚠️ API Issue: {str(e)[:100]}. Retrying in {wait:.1f}s...")
+
+            wait = (
+                2 ** attempt
+            ) + random.random()
+
+            log(
+                f"⚠️ API Issue: "
+                f"{str(e)[:100]}"
+            )
+
+            log(
+                f"🔄 Retrying in "
+                f"{wait:.1f}s..."
+            )
+
             time.sleep(wait)
-    return func(*args, **kwargs)
+
+    return func(
+        *args,
+        **kwargs
+    )
+
+
+# ============================================================
+# ERROR DESCRIPTION
+# ============================================================
 
 def describe_error(e):
-    # CHANGED: Selenium's TimeoutException has an empty message; always show the type
-    msg = str(e).strip().replace("\n", " ")
-    return f"{type(e).__name__}: {msg[:150] if msg else '(no message)'}"
+
+    msg = (
+        str(e)
+        .strip()
+        .replace(
+            "\n",
+            " "
+        )
+    )
+
+    return (
+        f"{type(e).__name__}: "
+        f"{msg[:150] if msg else '(no message)'}"
+    )
+
+
+# ============================================================
+# DEBUG
+# ============================================================
 
 _debug_saves = 0
 
-def save_debug(drv, label):
-    # NEW: save what the browser actually loaded
+
+def save_debug(
+    drv,
+    label
+):
+
     global _debug_saves
-    if drv is None or _debug_saves >= MAX_DEBUG_SAVES:
+
+    if (
+        drv is None
+        or _debug_saves >= MAX_DEBUG_SAVES
+    ):
+
         return
+
     _debug_saves += 1
+
     try:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-        safe = "".join(ch if ch.isalnum() else "_" for ch in label)[:60]
-        base = os.path.join(DEBUG_DIR, f"{_debug_saves:02d}_{safe}")
+
+        os.makedirs(
+            DEBUG_DIR,
+            exist_ok=True
+        )
+
+        safe = "".join(
+            ch
+            if ch.isalnum()
+            else "_"
+            for ch in label
+        )[:60]
+
+        base = os.path.join(
+            DEBUG_DIR,
+            f"{_debug_saves:02d}_{safe}"
+        )
+
         try:
-            log(f"   🧾 Page title: {drv.title!r}")
-            log(f"   🧾 Current URL: {drv.current_url}")
+
+            log(
+                f"   🧾 Page title: "
+                f"{drv.title!r}"
+            )
+
+            log(
+                f"   🧾 Current URL: "
+                f"{drv.current_url}"
+            )
+
         except Exception:
             pass
-        drv.save_screenshot(base + ".png")
-        with open(base + ".html", "w", encoding="utf-8") as f:
-            f.write(drv.page_source)
-        log(f"   🧾 Saved debug files: {base}.png / .html")
-    except Exception as e:
-        log(f"   ⚠️ Could not save debug files: {describe_error(e)}")
 
-# ---------------- STATE ---------------- #
-if os.path.exists(checkpoint_file):
+        drv.save_screenshot(
+            base + ".png"
+        )
+
+        with open(
+            base + ".html",
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                drv.page_source
+            )
+
+        log(
+            f"   🧾 Debug saved: "
+            f"{base}.png / {base}.html"
+        )
+
+    except Exception as e:
+
+        log(
+            f"   ⚠️ Debug save failed: "
+            f"{describe_error(e)}"
+        )
+
+
+# ============================================================
+# CHECKPOINT
+# ============================================================
+
+if os.path.exists(
+    CHECKPOINT_FILE
+):
+
     try:
-        last_i = max(int(open(checkpoint_file).read().strip()), START_ROW)
+
+        with open(
+            CHECKPOINT_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            last_i = max(
+                int(
+                    f.read().strip()
+                ),
+                START_ROW
+            )
+
     except Exception:
+
         last_i = START_ROW
+
 else:
+
     last_i = START_ROW
 
-# ---------------- DRIVER ---------------- #
+
+# ============================================================
+# DRIVER
+# ============================================================
+
 driver = None
 
-def create_driver():
-    log(f"🌐 [WEEK Shard {SHARD_INDEX}] Initializing browser...")
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--incognito")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    # CHANGED: removed the hard-coded "Chrome/120.0.0.0" user agent (years older
-    # than the Chrome GitHub installs). The real version is set below instead.
 
-    drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
-    drv.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+# ============================================================
+# COOKIE LOADER
+# ============================================================
+
+def load_tradingview_cookies(
+    drv
+):
+
+    if not os.path.exists(
+        COOKIE_FILE
+    ):
+
+        log(
+            f"⚠️ Cookie file not found: "
+            f"{COOKIE_FILE}"
+        )
+
+        return
 
     try:
-        ua = drv.execute_script("return navigator.userAgent").replace("HeadlessChrome", "Chrome")
-        drv.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
-        log(f"   🧭 Browser: {ua}")
-    except Exception as e:
-        log(f"   ⚠️ Could not set user agent: {describe_error(e)}")
 
-    if os.path.exists(COOKIE_FILE):
-        try:
-            drv.get("https://in.tradingview.com/")
-            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-                cookies = json.load(f)
-            added = failed = expired = 0
-            now = time.time()
-            for c in cookies:
-                cookie = {k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")}
-                exp = c.get("expiry") or c.get("expirationDate")
-                if exp and float(exp) < now:
-                    expired += 1
-                if "expiry" in cookie:
+        log(
+            "🍪 Opening TradingView "
+            "before applying cookies..."
+        )
+
+        drv.get(
+            "https://in.tradingview.com/"
+        )
+
+        time.sleep(3)
+
+        with open(
+            COOKIE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            cookies = json.load(f)
+
+        if not isinstance(
+            cookies,
+            list
+        ):
+
+            log(
+                "⚠️ cookies.json is not a list."
+            )
+
+            return
+
+        added = 0
+        failed = 0
+        expired = 0
+
+        now = time.time()
+
+        for raw_cookie in cookies:
+
+            try:
+
+                if (
+                    "name"
+                    not in raw_cookie
+                    or "value"
+                    not in raw_cookie
+                ):
+
+                    continue
+
+                cookie = {
+                    "name":
+                        raw_cookie["name"],
+                    "value":
+                        raw_cookie["value"]
+                }
+
+                # Path
+                if raw_cookie.get(
+                    "path"
+                ):
+
+                    cookie["path"] = (
+                        raw_cookie["path"]
+                    )
+
+                # Secure
+                if "secure" in raw_cookie:
+
+                    cookie["secure"] = bool(
+                        raw_cookie["secure"]
+                    )
+
+                # Domain
+                domain = raw_cookie.get(
+                    "domain"
+                )
+
+                if domain:
+
+                    if (
+                        "tradingview.com"
+                        in domain
+                    ):
+
+                        cookie["domain"] = domain
+
+                # Expiry
+                expiry = (
+                    raw_cookie.get(
+                        "expiry"
+                    )
+                    or
+                    raw_cookie.get(
+                        "expirationDate"
+                    )
+                )
+
+                if expiry:
+
                     try:
-                        cookie["expiry"] = int(cookie["expiry"])
+
+                        expiry_float = float(
+                            expiry
+                        )
+
+                        if (
+                            expiry_float
+                            < now
+                        ):
+
+                            expired += 1
+
+                        else:
+
+                            cookie["expiry"] = int(
+                                expiry_float
+                            )
+
                     except Exception:
-                        cookie.pop("expiry", None)
-                try:
-                    drv.add_cookie(cookie)
-                    added += 1
-                except Exception:
-                    failed += 1
-            # CHANGED: report cookie loading instead of failing silently
-            log(f"   🍪 Cookies: {added} added, {failed} failed, {expired} already expired (site: {drv.current_url})")
-            if expired:
-                log("   ⚠️ Some cookies are expired. Refresh the cookies secret if values are missing.")
-            drv.refresh()
-            time.sleep(2)
-        except Exception as e:
-            log(f"   ⚠️ Cookie loading failed: {describe_error(e)}")
-    else:
-        log(f"   ⚠️ No cookie file found at {COOKIE_FILE}")
+                        pass
+
+                # SameSite
+                same_site = raw_cookie.get(
+                    "sameSite"
+                )
+
+                if same_site in (
+                    "Strict",
+                    "Lax",
+                    "None"
+                ):
+
+                    cookie["sameSite"] = (
+                        same_site
+                    )
+
+                drv.add_cookie(
+                    cookie
+                )
+
+                added += 1
+
+            except Exception:
+
+                failed += 1
+
+        log(
+            f"🍪 Cookies: "
+            f"{added} added, "
+            f"{failed} failed, "
+            f"{expired} expired"
+        )
+
+        if expired:
+
+            log(
+                "⚠️ Some cookies are expired. "
+                "Update cookies.json if login "
+                "is not retained."
+            )
+
+        drv.refresh()
+
+        time.sleep(4)
+
+        log(
+            "🍪 TradingView refreshed "
+            "after cookies."
+        )
+
+    except Exception as e:
+
+        log(
+            f"⚠️ Cookie loading failed: "
+            f"{describe_error(e)}"
+        )
+
+
+# ============================================================
+# CREATE DRIVER
+# ============================================================
+
+def create_driver():
+
+    log(
+        f"🌐 [WEEK Shard {SHARD_INDEX}] "
+        f"Initializing Chrome..."
+    )
+
+    opts = Options()
+
+    opts.add_argument(
+        "--headless=new"
+    )
+
+    opts.add_argument(
+        "--no-sandbox"
+    )
+
+    opts.add_argument(
+        "--disable-dev-shm-usage"
+    )
+
+    opts.add_argument(
+        "--window-size=1920,1080"
+    )
+
+    opts.add_argument(
+        "--disable-gpu"
+    )
+
+    opts.add_argument(
+        "--disable-extensions"
+    )
+
+    opts.add_argument(
+        "--disable-notifications"
+    )
+
+    opts.add_argument(
+        "--disable-popup-blocking"
+    )
+
+    opts.add_argument(
+        "--lang=en-US"
+    )
+
+    opts.add_argument(
+        "--disable-blink-features="
+        "AutomationControlled"
+    )
+
+    opts.add_experimental_option(
+        "excludeSwitches",
+        [
+            "enable-automation",
+            "enable-logging"
+        ]
+    )
+
+    drv = webdriver.Chrome(
+        service=Service(
+            CHROME_DRIVER_PATH
+        ),
+        options=opts
+    )
+
+    drv.set_page_load_timeout(
+        PAGE_LOAD_TIMEOUT
+    )
+
+    # Browser UA
+    try:
+
+        ua = drv.execute_script(
+            "return navigator.userAgent"
+        )
+
+        ua = ua.replace(
+            "HeadlessChrome",
+            "Chrome"
+        )
+
+        drv.execute_cdp_cmd(
+            "Network.setUserAgentOverride",
+            {
+                "userAgent": ua
+            }
+        )
+
+        log(
+            f"   🧭 Browser: {ua}"
+        )
+
+    except Exception as e:
+
+        log(
+            f"   ⚠️ Could not set UA: "
+            f"{describe_error(e)}"
+        )
+
+    # Cookie login
+    load_tradingview_cookies(
+        drv
+    )
+
     return drv
 
+
+# ============================================================
+# DRIVER MANAGEMENT
+# ============================================================
+
 def ensure_driver():
+
     global driver
-    if driver is None: driver = create_driver()
+
+    if driver is None:
+
+        driver = create_driver()
+
     return driver
 
+
 def restart_driver():
+
     global driver
+
     if driver:
-        try: driver.quit()
-        except Exception: pass
+
+        try:
+            driver.quit()
+
+        except Exception:
+            pass
+
     driver = None
 
-# ---------------- SCRAPER ---------------- #
-def clean_value(v):
-    if not CLEAN_NUMBERS:
-        return v
-    return v.replace("−", "-").replace(",", "")
 
-def get_values(drv):
-    """Returns (values, indicator_found). indicator_found is None in default mode."""
+# ============================================================
+# NORMAL POPUPS
+# ============================================================
+
+def close_normal_popups(
+    drv
+):
+
+    selectors = [
+
+        "button[aria-label='Close']",
+
+        "button[aria-label='close']",
+
+        "[data-name='close']",
+
+        "[data-name='close-button']",
+
+        "[role='dialog'] "
+        "button[aria-label='Close']",
+
+        "[class*='dialog'] "
+        "button[aria-label='Close']",
+
+        "[class*='modal'] "
+        "button[aria-label='Close']",
+
+    ]
+
+    closed = 0
+
+    for selector in selectors:
+
+        try:
+
+            elements = drv.find_elements(
+                By.CSS_SELECTOR,
+                selector
+            )
+
+            for element in elements:
+
+                try:
+
+                    if element.is_displayed():
+
+                        drv.execute_script(
+                            "arguments[0].click();",
+                            element
+                        )
+
+                        closed += 1
+
+                        time.sleep(
+                            0.3
+                        )
+
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+    if closed:
+
+        log(
+            f"🧹 Closed "
+            f"{closed} normal popup(s)"
+        )
+
+
+# ============================================================
+# REAL VERIFICATION DETECTION
+# ============================================================
+
+def check_real_verification(
+    drv
+):
+
+    """
+    IMPORTANT:
+
+    Never use:
+
+        'captcha' in drv.page_source
+
+    TradingView can contain the word
+    captcha in JavaScript/resources even
+    when the chart is completely valid.
+
+    We only inspect visible page text.
+    """
+
     try:
+
+        current_url = (
+            drv.current_url
+            .lower()
+        )
+
+        body = drv.find_element(
+            By.TAG_NAME,
+            "body"
+        )
+
+        visible_text = (
+            body.text
+            .lower()
+            .strip()
+        )
+
+        if not visible_text:
+
+            return False
+
+        real_messages = [
+
+            "verify you are human",
+
+            "checking your browser",
+
+            "access denied",
+
+            "unusual traffic",
+
+            "enable javascript and cookies",
+
+        ]
+
+        for message in real_messages:
+
+            if message in visible_text:
+
+                log(
+                    f"🚨 Actual visible "
+                    f"verification detected: "
+                    f"{message}"
+                )
+
+                return True
+
+        # We intentionally DO NOT check
+        # page_source for "captcha".
+
+        return False
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
+# LEAF VALUE ELEMENTS
+# ============================================================
+
+def get_leaf_value_elements(
+    drv,
+    selector
+):
+
+    try:
+
+        elements = drv.find_elements(
+            By.CSS_SELECTOR,
+            selector
+        )
+
+    except Exception:
+
+        return []
+
+    if not elements:
+
+        return []
+
+    leaves = []
+
+    for element in elements:
+
+        try:
+
+            children = element.find_elements(
+                By.CSS_SELECTOR,
+                selector
+            )
+
+            # Parent/container contains
+            # other value elements.
+            #
+            # Ignore it.
+            if children:
+
+                continue
+
+            leaves.append(
+                element
+            )
+
+        except Exception:
+
+            continue
+
+    return leaves
+
+
+# ============================================================
+# GET VALUES
+# ============================================================
+
+def get_values(
+    drv
+):
+
+    """
+    Returns:
+
+        values
+        indicator_found
+
+    indicator_found is None when using
+    normal/all-values mode.
+    """
+
+    try:
+
+        # ----------------------------------------------------
+        # INDICATOR MODE
+        # ----------------------------------------------------
+
         if INDICATOR_TITLE:
-            result = drv.execute_script(GET_VALUES_JS, INDICATOR_TITLE) or {}
-            vals = [v for v in result.get("values", []) if v]
-            return vals, bool(result.get("found"))
-        # Default: same as the original script
-        elements = drv.find_elements(By.CSS_SELECTOR, "div[class*='valueValue']")
-        return [el.text.strip() for el in elements if el.text.strip()], None
+
+            result = drv.execute_script(
+                GET_INDICATOR_VALUES_JS,
+                INDICATOR_TITLE
+            ) or {}
+
+            values = []
+
+            for value in result.get(
+                "values",
+                []
+            ):
+
+                if not value:
+                    continue
+
+                lines = [
+                    x.strip()
+                    for x in value.splitlines()
+                    if x.strip()
+                ]
+
+                values.extend(
+                    lines
+                )
+
+            return (
+                values,
+                bool(
+                    result.get(
+                        "found"
+                    )
+                )
+            )
+
+        # ----------------------------------------------------
+        # NORMAL MODE
+        # ----------------------------------------------------
+
+        selectors = [
+
+            "[class*='valueValue']",
+
+            "[class*='valueValue-']",
+
+            "[data-name='legend-source-item-value']",
+
+            "[data-name='legend-series-item-value']",
+
+        ]
+
+        best_values = []
+
+        for selector in selectors:
+
+            elements = (
+                get_leaf_value_elements(
+                    drv,
+                    selector
+                )
+            )
+
+            if not elements:
+                continue
+
+            values = []
+
+            seen_elements = set()
+
+            for element in elements:
+
+                try:
+
+                    element_id = element.id
+
+                    if (
+                        element_id
+                        in seen_elements
+                    ):
+
+                        continue
+
+                    seen_elements.add(
+                        element_id
+                    )
+
+                    text = (
+                        element.text
+                        .strip()
+                    )
+
+                    if not text:
+
+                        continue
+
+                    lines = [
+                        x.strip()
+                        for x
+                        in text.splitlines()
+                        if x.strip()
+                    ]
+
+                    # IMPORTANT:
+                    # duplicates are preserved.
+                    values.extend(
+                        lines
+                    )
+
+                except Exception:
+
+                    continue
+
+            log(
+                f"🔎 {selector} -> "
+                f"{len(values)} values"
+            )
+
+            if (
+                len(values)
+                > len(best_values)
+            ):
+
+                best_values = values
+
+            if (
+                len(values)
+                >= EXPECTED_COUNT
+            ):
+
+                return (
+                    values[
+                        :EXPECTED_COUNT
+                    ],
+                    None
+                )
+
+        return (
+            best_values[
+                :EXPECTED_COUNT
+            ],
+            None
+        )
+
     except Exception as e:
-        log(f"   ⚠️ Could not read values: {describe_error(e)}")
+
+        log(
+            f"   ⚠️ Value extraction "
+            f"error: "
+            f"{describe_error(e)}"
+        )
+
         return [], False
 
-def scrape_week(url, label=""):
-    if not url: return [], False
-    for attempt in range(2):
-        drv = None
+
+# ============================================================
+# CLEAN VALUE
+# ============================================================
+
+def clean_value(
+    value
+):
+
+    if not CLEAN_NUMBERS:
+
+        return value
+
+    return (
+        value
+        .replace(
+            "−",
+            "-"
+        )
+        .replace(
+            ",",
+            ""
+        )
+    )
+
+
+# ============================================================
+# WAIT FOR VALUES
+# ============================================================
+
+def wait_for_values(
+    drv,
+    timeout
+):
+
+    start = time.time()
+
+    best_values = []
+
+    while (
+        time.time() - start
+        < timeout
+    ):
+
         try:
-            drv = ensure_driver()
-            drv.get(url)
 
-            # CHANGED: wait until all values have rendered (instead of waiting for
-            # one element, sleeping and scrolling - the chart doesn't scroll)
-            try:
-                WebDriverWait(drv, VALUES_TIMEOUT, poll_frequency=1).until(
-                    lambda d: len(get_values(d)[0]) >= EXPECTED_COUNT
+            close_normal_popups(
+                drv
+            )
+
+            values, found = (
+                get_values(
+                    drv
                 )
-            except TimeoutException:
-                pass  # reported below
+            )
 
-            vals, found = get_values(drv)
+            if (
+                len(values)
+                > len(best_values)
+            ):
 
-            if len(vals) >= EXPECTED_COUNT:
-                return [clean_value(v) for v in vals[:EXPECTED_COUNT]], True
+                best_values = values
 
-            # NEW: say why it failed
-            if found is False:
-                reason = f"indicator title '{INDICATOR_TITLE}' not on page (wrong page, logged out, blocked, or not loaded)"
-            elif not vals:
-                reason = "no values on page (wrong page, logged out, blocked, or not loaded)"
-            else:
-                reason = f"only {len(vals)}/{EXPECTED_COUNT} values"
-            log(f"   ⚠️ Attempt {attempt+1}: {reason}")
-            save_debug(drv, f"{label}_attempt{attempt+1}")
+                log(
+                    f"📊 Values found: "
+                    f"{len(best_values)}/"
+                    f"{EXPECTED_COUNT}"
+                )
 
-            if attempt == 0:
-                continue  # try once more with the same browser
-            return [clean_value(v) for v in vals], False  # Partially found
+            if (
+                len(best_values)
+                >= EXPECTED_COUNT
+            ):
+
+                return (
+                    best_values[
+                        :EXPECTED_COUNT
+                    ],
+                    found
+                )
+
         except Exception as e:
-            # CHANGED: full error type + traceback instead of 50 characters
-            log(f"   ❌ Scrape Attempt {attempt+1} Failed: {describe_error(e)}")
-            log(traceback.format_exc().strip()[-800:])
-            save_debug(drv, f"{label}_error{attempt+1}")
-            restart_driver()  # only a crash needs a fresh browser
+
+            log(
+                f"⚠️ Waiting error: "
+                f"{describe_error(e)}"
+            )
+
+        time.sleep(1)
+
+    return (
+        best_values[
+            :EXPECTED_COUNT
+        ],
+        None
+    )
+
+
+# ============================================================
+# SCRAPE WEEK
+# ============================================================
+
+def scrape_week(
+    url,
+    label=""
+):
+
+    if not url:
+
+        return [], False
+
+    for attempt in range(
+        1,
+        4
+    ):
+
+        drv = None
+
+        try:
+
+            drv = ensure_driver()
+
+            log(
+                f"🌐 Opening URL "
+                f"(attempt {attempt}/3)"
+            )
+
+            log(
+                f"🔗 {url}"
+            )
+
+            drv.get(
+                url
+            )
+
+            # ------------------------------------------------
+            # Initial rendering
+            # ------------------------------------------------
+
+            time.sleep(5)
+
+            log(
+                f"📄 Title: "
+                f"{drv.title}"
+            )
+
+            log(
+                f"🌐 Current URL: "
+                f"{drv.current_url}"
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Don't use "captcha" in page_source.
+            # ------------------------------------------------
+
+            if check_real_verification(
+                drv
+            ):
+
+                log(
+                    "⚠️ Actual visible "
+                    "verification page."
+                )
+
+                save_debug(
+                    drv,
+                    f"{label}_verification"
+                )
+
+                restart_driver()
+
+                if attempt < 3:
+
+                    time.sleep(
+                        5 + attempt
+                    )
+
+                    continue
+
+                return [], False
+
+            # ------------------------------------------------
+            # Close normal popups
+            # ------------------------------------------------
+
+            close_normal_popups(
+                drv
+            )
+
+            # ------------------------------------------------
+            # Wait for 24 values
+            # ------------------------------------------------
+
+            vals, found = (
+                wait_for_values(
+                    drv,
+                    VALUES_TIMEOUT
+                )
+            )
+
+            # ------------------------------------------------
+            # SUCCESS
+            # ------------------------------------------------
+
+            if (
+                len(vals)
+                >= EXPECTED_COUNT
+            ):
+
+                vals = [
+                    clean_value(v)
+                    for v in vals[
+                        :EXPECTED_COUNT
+                    ]
+                ]
+
+                log(
+                    f"✅ SUCCESS: "
+                    f"{len(vals)}/"
+                    f"{EXPECTED_COUNT}"
+                )
+
+                for number, value in enumerate(
+                    vals,
+                    start=1
+                ):
+
+                    log(
+                        f"   {number:02d}: "
+                        f"{value}"
+                    )
+
+                return vals, True
+
+            # ------------------------------------------------
+            # FAILURE REASON
+            # ------------------------------------------------
+
+            if (
+                INDICATOR_TITLE
+                and found is False
+            ):
+
+                reason = (
+                    f"indicator "
+                    f"'{INDICATOR_TITLE}' "
+                    f"not found"
+                )
+
+            elif not vals:
+
+                reason = (
+                    "no values found"
+                )
+
+            else:
+
+                reason = (
+                    f"only "
+                    f"{len(vals)}/"
+                    f"{EXPECTED_COUNT} "
+                    f"values found"
+                )
+
+            log(
+                f"⚠️ Attempt {attempt}: "
+                f"{reason}"
+            )
+
+            if vals:
+
+                log(
+                    "📋 Partial values:"
+                )
+
+                for number, value in enumerate(
+                    vals,
+                    start=1
+                ):
+
+                    log(
+                        f"   {number:02d}: "
+                        f"{value}"
+                    )
+
+            save_debug(
+                drv,
+                f"{label}_attempt{attempt}"
+            )
+
+            # ------------------------------------------------
+            # Retry same browser once
+            # ------------------------------------------------
+
+            if attempt == 1:
+
+                log(
+                    "🔄 Retrying same "
+                    "browser..."
+                )
+
+                time.sleep(3)
+
+                continue
+
+            # ------------------------------------------------
+            # Restart browser for final retry
+            # ------------------------------------------------
+
+            if attempt == 2:
+
+                log(
+                    "♻️ Restarting Chrome "
+                    "before final retry..."
+                )
+
+                restart_driver()
+
+                time.sleep(5)
+
+                continue
+
+            # ------------------------------------------------
+            # Final failure
+            # ------------------------------------------------
+
+            vals = [
+                clean_value(v)
+                for v in vals
+            ]
+
+            return vals, False
+
+        except Exception as e:
+
+            log(
+                f"❌ Scrape Attempt "
+                f"{attempt}/3 Failed: "
+                f"{describe_error(e)}"
+            )
+
+            log(
+                traceback.format_exc()
+                .strip()[-800:]
+            )
+
+            save_debug(
+                drv,
+                f"{label}_error{attempt}"
+            )
+
+            restart_driver()
+
+            if attempt < 3:
+
+                time.sleep(
+                    3 + attempt
+                )
+
     return [], False
 
-# ---------------- CORE LOGIC ---------------- #
-def process_row(i, company_list, url_list, current_date):
-    name = company_list[i].strip() if i < len(company_list) else "Unknown"
-    url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
 
-    log(f"🔍 [{i+1}] {name}")
-    vals, is_success = scrape_week(url, label=f"{i+1}_{name}")
+# ============================================================
+# PROCESS ROW
+# ============================================================
+
+def process_row(
+    i,
+    company_list,
+    url_list,
+    current_date
+):
+
+    name = (
+        company_list[i].strip()
+        if i < len(company_list)
+        else "Unknown"
+    )
+
+    url = (
+
+        url_list[i].strip()
+
+        if (
+            i < len(url_list)
+            and "http"
+            in url_list[i]
+        )
+
+        else None
+    )
+
+    log(
+        f"🔍 [{i + 1}] "
+        f"{name} | "
+        f"URL: "
+        f"{url if url else 'No URL'}"
+    )
+
+    vals, is_success = scrape_week(
+        url,
+        label=f"{i + 1}_{name}"
+    )
+
+    # --------------------------------------------------------
+    # EXACTLY 24 CELLS
+    # --------------------------------------------------------
+
+    padded_vals = (
+        vals
+        + [""] * EXPECTED_COUNT
+    )[:EXPECTED_COUNT]
+
+    assert (
+        len(padded_vals)
+        == EXPECTED_COUNT
+    )
 
     row_idx = i + 1
-    padded_vals = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
 
     row_payload = [
-        {"range": f"A{row_idx}", "values": [[name]]},
-        {"range": f"B{row_idx}", "values": [[current_date]]},
-        {"range": f"{WEEK_START_COL_LETTER}{row_idx}:{WEEK_END_COL_LETTER}{row_idx}", "values": [padded_vals]}
-    ]
-    # rows without a URL don't count as scraping failures
-    return row_payload, is_success, bool(url)
 
-# ---------------- MAIN ---------------- #
+        {
+            "range":
+                f"A{row_idx}",
+            "values":
+                [[name]]
+        },
+
+        {
+            "range":
+                f"B{row_idx}",
+            "values":
+                [[current_date]]
+        },
+
+        {
+            "range":
+                f"{WEEK_START_COL_LETTER}"
+                f"{row_idx}:"
+                f"{WEEK_END_COL_LETTER}"
+                f"{row_idx}",
+
+            "values":
+                [padded_vals]
+        }
+
+    ]
+
+    # Rows without URL are not failures
+    return (
+        row_payload,
+        is_success,
+        bool(url)
+    )
+
+
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
+
 def connect_sheets():
-    gc = gspread.service_account("credentials.json")
-    sh_main = gc.open("Stock List").worksheet("Sheet1")
-    sh_data = gc.open("MV2 WEEK").worksheet("Sheet1")
-    return sh_main, sh_data
+
+    gc = gspread.service_account(
+        "credentials.json"
+    )
+
+    sh_main = gc.open(
+        "Stock List"
+    ).worksheet(
+        "Sheet1"
+    )
+
+    sh_data = gc.open(
+        "MV2 WEEK"
+    ).worksheet(
+        "Sheet1"
+    )
+
+    return (
+        sh_main,
+        sh_data
+    )
+
+
+# ============================================================
+# CONNECT
+# ============================================================
 
 try:
-    sheet_main, sheet_data = connect_sheets()
-    company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 8) # Column H
-    loop_end = min(END_ROW, len(company_list))
-    log(f"✅ Ready. Processing Rows {last_i + 1} to {loop_end}")
-    log(f"   Mode: {'indicator ' + repr(INDICATOR_TITLE) if INDICATOR_TITLE else 'all values on page (original behaviour)'}")
+
+    sheet_main, sheet_data = (
+        connect_sheets()
+    )
+
+    company_list = api_retry(
+        sheet_main.col_values,
+        1
+    )
+
+    # WEEK URL = Column H
+    url_list = api_retry(
+        sheet_main.col_values,
+        8
+    )
+
+    loop_end = min(
+        END_ROW,
+        len(company_list)
+    )
+
+    log(
+        f"✅ Ready. Processing "
+        f"Rows {last_i + 1} "
+        f"to {loop_end}"
+    )
+
+    log(
+        "   Mode: "
+        + (
+            "indicator "
+            + repr(INDICATOR_TITLE)
+            if INDICATOR_TITLE
+            else
+            "all values on page"
+        )
+    )
+
 except Exception as e:
-    log(f"❌ Initial Connection Error: {e}"); sys.exit(1)
+
+    log(
+        f"❌ Initial Connection Error: "
+        f"{describe_error(e)}"
+    )
+
+    sys.exit(1)
+
+
+# ============================================================
+# STATE
+# ============================================================
 
 retry_indices = []
+
 batch_list = []
-current_date = date.today().strftime("%m/%d/%Y")
+
+current_date = date.today().strftime(
+    "%m/%d/%Y"
+)
+
 consecutive_fails = 0
+
 streak_start = None
+
 aborted = False
 
-# --- FIRST PASS ---
+
+# ============================================================
+# FIRST PASS
+# ============================================================
+
 try:
-    for i in range(last_i, loop_end):
-        payload, success, had_url = process_row(i, company_list, url_list, current_date)
-        batch_list.extend(payload)
+
+    for i in range(
+        last_i,
+        loop_end
+    ):
+
+        payload, success, had_url = (
+            process_row(
+                i,
+                company_list,
+                url_list,
+                current_date
+            )
+        )
+
+        batch_list.extend(
+            payload
+        )
 
         if not success:
+
             retry_indices.append(i)
 
-        # NEW: count failures in a row
-        if had_url and not success:
-            if consecutive_fails == 0:
+        # --------------------------------------------
+        # Consecutive failures
+        # --------------------------------------------
+
+        if (
+            had_url
+            and not success
+        ):
+
+            if (
+                consecutive_fails
+                == 0
+            ):
+
                 streak_start = i
+
             consecutive_fails += 1
+
         elif success:
+
             consecutive_fails = 0
+
             streak_start = None
 
-        with open(checkpoint_file, "w") as f: f.write(str(i + 1))
+        # --------------------------------------------
+        # Checkpoint
+        # --------------------------------------------
 
-        if MAX_CONSECUTIVE_FAILS and consecutive_fails >= MAX_CONSECUTIVE_FAILS:
-            log(f"🛑 {consecutive_fails} symbols in a row failed. Stopping early - check the debug screenshots in the workflow artifacts.")
-            # point the checkpoint back so a rerun doesn't skip these symbols
-            with open(checkpoint_file, "w") as f: f.write(str(streak_start))
+        with open(
+            CHECKPOINT_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                str(i + 1)
+            )
+
+        # --------------------------------------------
+        # Stop after consecutive failures
+        # --------------------------------------------
+
+        if (
+            MAX_CONSECUTIVE_FAILS
+            and
+            consecutive_fails
+            >= MAX_CONSECUTIVE_FAILS
+        ):
+
+            log(
+                f"🛑 "
+                f"{consecutive_fails} "
+                f"symbols in a row failed."
+            )
+
+            log(
+                "🛑 Stopping WEEK shard."
+            )
+
+            with open(
+                CHECKPOINT_FILE,
+                "w",
+                encoding="utf-8"
+            ) as f:
+
+                f.write(
+                    str(streak_start)
+                )
+
             aborted = True
+
             break
 
-        if (i + 1) % RESTART_EVERY_ROWS == 0: restart_driver()
+        # --------------------------------------------
+        # Periodic restart
+        # --------------------------------------------
 
-        if len(batch_list) // 3 >= BATCH_SIZE:
-            log(f"🚀 Uploading batch of {BATCH_SIZE}...")
-            api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+        if (
+            (i + 1)
+            % RESTART_EVERY_ROWS
+            == 0
+        ):
+
+            log(
+                "♻️ Scheduled Chrome "
+                "restart..."
+            )
+
+            restart_driver()
+
+        # --------------------------------------------
+        # Upload batch
+        # 3 ranges per row
+        # --------------------------------------------
+
+        if (
+            len(batch_list) // 3
+            >= BATCH_SIZE
+        ):
+
+            log(
+                f"🚀 Uploading batch "
+                f"of {BATCH_SIZE}..."
+            )
+
+            api_retry(
+                sheet_data.batch_update,
+                batch_list,
+                value_input_option="RAW"
+            )
+
             batch_list = []
+
 finally:
+
     if batch_list:
-        api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+
+        log(
+            "🚀 Uploading remaining "
+            "batch..."
+        )
+
+        api_retry(
+            sheet_data.batch_update,
+            batch_list,
+            value_input_option="RAW"
+        )
+
         batch_list = []
 
+
+# ============================================================
+# ABORT
+# ============================================================
+
 if aborted:
-    restart_driver()
-    log("❌ WEEK SHARD ABORTED (too many failures in a row).")
-    sys.exit(1)  # makes the GitHub run show as failed
 
-# --- RETRY PASS ---
+    restart_driver()
+
+    log(
+        "❌ WEEK SHARD ABORTED."
+    )
+
+    sys.exit(1)
+
+
+# ============================================================
+# RETRY PASS
+# ============================================================
+
 if retry_indices:
-    log(f"🔁 Starting Retry Pass for {len(retry_indices)} symbols...")
+
+    log(
+        f"🔁 Starting Retry Pass "
+        f"for "
+        f"{len(retry_indices)} "
+        f"symbols..."
+    )
+
     restart_driver()
 
-    for idx, i in enumerate(retry_indices):
-        payload, success, _ = process_row(i, company_list, url_list, current_date)
-        batch_list.extend(payload)
+    batch_list = []
 
-        # In retry pass, restart driver more often (every 10 rows) for stability
-        if (idx + 1) % 10 == 0: restart_driver()
+    for idx, i in enumerate(
+        retry_indices,
+        start=1
+    ):
 
-        if len(batch_list) // 3 >= 10: # Smaller batch for retries
-            api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+        payload, success, _ = (
+            process_row(
+                i,
+                company_list,
+                url_list,
+                current_date
+            )
+        )
+
+        batch_list.extend(
+            payload
+        )
+
+        # Restart every 10 retry rows
+        if idx % 10 == 0:
+
+            log(
+                "♻️ Retry-pass Chrome "
+                "restart..."
+            )
+
+            restart_driver()
+
+        # Smaller retry batches
+        if (
+            len(batch_list) // 3
+            >= 10
+        ):
+
+            api_retry(
+                sheet_data.batch_update,
+                batch_list,
+                value_input_option="RAW"
+            )
+
             batch_list = []
 
     if batch_list:
-        api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+
+        api_retry(
+            sheet_data.batch_update,
+            batch_list,
+            value_input_option="RAW"
+        )
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
 
 restart_driver()
-log("🏁 WEEK SHARD COMPLETED.")
+
+log(
+    "🏁 WEEK SHARD COMPLETED."
+)
