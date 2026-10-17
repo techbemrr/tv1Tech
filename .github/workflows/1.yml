@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        shard_index: [0, 1, 2, 3, 4]
+        shard_index: [0, 1]  # Reduced to 2 shards for faster testing
 
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +29,12 @@ jobs:
         run: |
           echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
           echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
+
+      # TEMPORARY TEST STEP - Forces a failure to test email alert
+      - name: Force Failure Test
+        run: |
+          echo "Simulating a script failure to trigger email..."
+          exit 1
 
       - name: Run scraper
         env:
