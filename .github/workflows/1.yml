@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        shard_index: [0, 1]  # Reduced to 2 shards for faster testing
+        shard_index: [0, 1] # Temporarily 2 shards for testing
 
     steps:
       - uses: actions/checkout@v4
@@ -30,10 +30,10 @@ jobs:
           echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
           echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
 
-      # TEMPORARY TEST STEP - Forces a failure to test email alert
+      # TEMPORARY TEST STEP (Triggers failure)
       - name: Force Failure Test
         run: |
-          echo "Simulating a script failure to trigger email..."
+          echo "Simulating a script failure..."
           exit 1
 
       - name: Run scraper
@@ -47,8 +47,8 @@ jobs:
       # NOTIFY ON FAILURE
       # ============================================================
       - name: Send Failure Email Notification
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
+        if: ${{ always() && failure() }}
+        uses: dawidd6/action-send-mail@v4
         with:
           server_address: smtp.gmail.com
           server_port: 465
