@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        shard_index: [0, 1] # Temporarily 2 shards for testing
+        shard_index: [0, 1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@v4
@@ -30,43 +30,9 @@ jobs:
           echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
           echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
 
-      # TEMPORARY TEST STEP (Triggers failure)
-      - name: Force Failure Test
-        run: |
-          echo "Simulating a script failure..."
-          exit 1
-
       - name: Run scraper
         env:
           SHARD_INDEX: ${{ matrix.shard_index }}
           SHARD_SIZE: 102
           CHECKPOINT_FILE: checkpoint_${{ matrix.shard_index }}.txt
         run: python run_scraper.py
-
-      # ============================================================
-      # NOTIFY ON FAILURE
-      # ============================================================
-      - name: Send Failure Email Notification
-        if: ${{ always() && failure() }}
-        uses: dawidd6/action-send-mail@v4
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.EMAIL_USERNAME }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "⚠️ Scraping Failed: Shard ${{ matrix.shard_index }} (${{ github.workflow }})"
-          to: ${{ secrets.NOTIFICATION_EMAIL }}
-          from: "GitHub Actions Scraper <${{ secrets.EMAIL_USERNAME }}>"
-          body: |
-            Hello,
-
-            The scraping job failed on Shard ${{ matrix.shard_index }}.
-
-            Details:
-            - Workflow: ${{ github.workflow }}
-            - Run ID: ${{ github.run_id }}
-            - Shard Index: ${{ matrix.shard_index }}
-            - Repository: ${{ github.repository }}
-
-            View logs and rerun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
