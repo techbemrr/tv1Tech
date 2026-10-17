@@ -36,3 +36,31 @@ jobs:
           SHARD_SIZE: 102
           CHECKPOINT_FILE: checkpoint_${{ matrix.shard_index }}.txt
         run: python run_scraper.py
+
+      # ============================================================
+      # NOTIFY ON FAILURE
+      # ============================================================
+      - name: Send Failure Email Notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "⚠️ Scraping Failed: Shard ${{ matrix.shard_index }} (${{ github.workflow }})"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: "GitHub Actions Scraper <${{ secrets.EMAIL_USERNAME }}>"
+          body: |
+            Hello,
+
+            The scraping job failed on Shard ${{ matrix.shard_index }}.
+
+            Details:
+            - Workflow: ${{ github.workflow }}
+            - Run ID: ${{ github.run_id }}
+            - Shard Index: ${{ matrix.shard_index }}
+            - Repository: ${{ github.repository }}
+
+            View logs and rerun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
